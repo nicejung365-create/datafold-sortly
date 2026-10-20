@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"C:/Users/nicej/OneDrive/바탕 화면/my_service/.claude/hooks/prd_lock.py\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"C:/Users/nicej/OneDrive/바탕 화면/my_service/.claude/hooks/upload_notice_check.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

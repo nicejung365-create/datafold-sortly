@@ -1,0 +1,20 @@
+# 비밀 키 (Supabase·Gemini 키가 들어 있음)
+.env
+
+# 실행하면 저절로 생기는 파이썬 임시 파일
+__pycache__/
+*.pyc
+
+# Supabase 표를 통째로 내려받은 백업 — 다시 받을 수 있는 데이터라 기록에 넣지 않음
+backup/
+
+# 내 컴퓨터에서만 쓰는 Claude Code 개인 설정
+.claude/settings.local.json
+
+# Streamlit 비밀 설정 (나중에 생길 경우 대비)
+.streamlit/secrets.toml
+
+# 윈도·OneDrive·맥이 저절로 만드는 파일
+desktop.ini
+Thumbs.db
+.DS_Store
