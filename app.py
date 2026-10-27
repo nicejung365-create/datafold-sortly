@@ -371,8 +371,9 @@ def make_rows(batch_id, source_type, source_name, items, tag_list):
     ]
 
 
+# 0 = 첫 화면(랜딩 페이지), 1~3 = 기능 화면 — streamlit run app.py 로 열면 첫 화면부터 뜸
 if "page" not in st.session_state:
-    st.session_state.page = 1
+    st.session_state.page = 0
 
 
 def go(page):
@@ -594,6 +595,116 @@ def screen_3():
                 st.markdown(
                     f"`생애주기 : {row['lifecycle']}` `분야 : {row['field']}` `정보유형 : {row['info_type']}`"
                 )
+
+
+# ---------- 첫 화면(랜딩 페이지) — 서비스 소개 (근거: PRD.md 목표·넣을 기능 1~3) ----------
+
+LANDING_BG, LANDING_ACCENT, LANDING_TEXT = "#242627", "#3fb645", "#ebeceb"
+# 강조색이 배경색과 같으면 강조색 자리(제목·카드 테두리·버튼 바탕)가 배경에 묻히므로 글자색으로 대신 보이게 하고,
+# 버튼 글자는 강조색으로 씀
+_SAME = LANDING_ACCENT.lower() == LANDING_BG.lower()
+LANDING_MARK = LANDING_TEXT if _SAME else LANDING_ACCENT  # 제목·카드 제목·카드 테두리·버튼 바탕
+LANDING_BUTTON_TEXT = LANDING_ACCENT if _SAME else LANDING_BG
+# 카드 바탕은 글자색을 아주 옅게 깔아, 배경 위에서 카드 구역이 구분되게 함
+LANDING_CARD_BG = "rgba({}, {}, {}, 0.10)".format(*(int(LANDING_TEXT[i:i + 2], 16) for i in (1, 3, 5)))
+LANDING_FEATURES = [
+    ("📂", "자동으로 나누기",
+     "표·글 파일이나 게시물 URL을 넣으면, 있는 기준은 참고하고 없는 기준은 새로 만들어 카테고리로 나눕니다."),
+    ("🏷️", "세 기준으로 한눈에 보기",
+     "나뉜 결과를 소재 카드마다 생애주기·분야·정보유형 태그 3개로 함께 보여 줍니다."),
+    ("⬇️", "바로 내려받기",
+     "나뉜 결과를 콘텐츠를 만들 때 바로 쓸 수 있는 정리된 파일로 내려받습니다."),
+]
+# 히어로 영역 배경 영상 — make_hero.py 로 만듦. 파일이 없으면 같은 자리에 초록 빛 번짐 그림을 대신 깜
+HERO_VIDEO_PATH = Path(__file__).parent / "hero.mp4"
+
+
+def hero_background():
+    if HERO_VIDEO_PATH.exists():
+        # st.video 는 영상을 파일로 따로 보내 주므로 페이지가 무거워지지 않음
+        # muted 여야 브라우저가 자동 재생을 허락함, loop 로 끝없이 반복
+        st.video(str(HERO_VIDEO_PATH), autoplay=True, muted=True, loop=True)
+    else:
+        st.markdown("<div class='landing-hero-media landing-hero-fallback'></div>", unsafe_allow_html=True)
+    # 영상 위에 배경색을 반쯤 덮어, 위에 올린 제목·버튼 글자가 잘 읽히게 함
+    st.markdown("<div class='landing-hero-shade'></div>", unsafe_allow_html=True)
+
+
+def landing():
+    # 색은 이 첫 화면에만 씀 — 기능 화면(1~3)에는 이 스타일이 들어가지 않음
+    st.markdown(f"""
+<style>
+.stApp {{ background: {LANDING_BG}; }}
+[data-testid="stHeader"] {{ background: transparent; color: {LANDING_TEXT}; }}
+[data-testid="stHeader"] button, [data-testid="stHeader"] svg {{ color: {LANDING_TEXT}; fill: {LANDING_TEXT}; }}
+.st-key-landing p, .st-key-landing li {{ color: {LANDING_TEXT}; }}
+/* 히어로 영역: 배경 영상을 깔고 그 위에 제목·소개·버튼을 가운데로 올림 */
+.st-key-landing_hero {{
+    position: relative; overflow: hidden; border-radius: 20px; min-height: 440px;
+    justify-content: center; padding: 48px 24px; margin-bottom: 32px;
+}}
+/* 배경 상자(와 그것을 감싼 틀)는 히어로 영역 전체를 채우고 맨 뒤에, 나머지(제목·소개·버튼)는 그 위에 */
+.st-key-landing_hero > div:has(.st-key-landing_hero_bg) {{ position: absolute; inset: 0; z-index: 0; }}
+.st-key-landing_hero_bg {{ position: absolute; inset: 0; }}
+.st-key-landing_hero_bg [data-testid="stElementContainer"] {{ position: static; }}
+.st-key-landing_hero > div:not(:has(.st-key-landing_hero_bg)) {{ position: relative; z-index: 1; }}
+.landing-hero-media, .st-key-landing_hero_bg video {{
+    position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover;
+}}
+/* 배경 영상은 보기만 하는 것 — 재생 단추 등 조작 막대를 숨기고 눌리지 않게 함 */
+.st-key-landing_hero_bg video {{ pointer-events: none; }}
+.st-key-landing_hero_bg video::-webkit-media-controls {{ display: none !important; }}
+.landing-hero-fallback {{
+    background:
+        radial-gradient(circle at 30% 40%, rgba(63, 182, 69, 0.28), transparent 45%),
+        radial-gradient(circle at 72% 60%, rgba(63, 182, 69, 0.22), transparent 50%),
+        {LANDING_BG};
+}}
+.landing-hero-shade {{ position: absolute; inset: 0; background: rgba(36, 38, 39, 0.45); }}
+.landing-title {{
+    color: {LANDING_MARK}; font-size: 2.8rem; font-weight: 800; line-height: 1.25;
+    text-align: center; margin: 0 0 12px;
+}}
+.landing-intro {{ color: {LANDING_TEXT}; font-size: 1.3rem; text-align: center; margin-bottom: 8px; }}
+[class*="st-key-landing_card"] {{
+    background: {LANDING_CARD_BG}; border: 1px solid {LANDING_MARK}; border-radius: 14px;
+    padding: 24px; height: 100%;
+}}
+.landing-card-icon {{ font-size: 2rem; }}
+.landing-card-title {{ color: {LANDING_MARK}; font-size: 1.25rem; font-weight: 800; margin: 8px 0; }}
+/* 버튼: 꽉 찬 바탕 + 대비되는 글자, 마우스를 올리면 테두리만 남는 모양으로 바뀜 */
+.st-key-landing_start button {{
+    background: {LANDING_MARK}; border: 2px solid {LANDING_MARK};
+    font-size: 1.1rem; padding: 12px 0; margin-top: 32px;
+}}
+.st-key-landing_start button:hover {{ background: transparent; border-color: {LANDING_TEXT}; }}
+.st-key-landing .st-key-landing_start button p {{ color: {LANDING_BUTTON_TEXT}; font-size: 1.1rem; font-weight: 700; }}
+.st-key-landing .st-key-landing_start button:hover p {{ color: {LANDING_TEXT}; }}
+</style>
+""", unsafe_allow_html=True)
+
+    with st.container(key="landing"):
+        # 히어로 영역: 배경 영상 위에 큰 제목 · 한 줄 소개 · [시작하기]
+        with st.container(key="landing_hero"):
+            with st.container(key="landing_hero_bg"):
+                hero_background()
+            st.markdown(f"<div class='landing-title'>{SERVICE_NAME}</div>", unsafe_allow_html=True)
+            st.markdown(
+                "<div class='landing-intro'>표·글 파일이나 게시물 URL을 넣으면 생애주기·분야·정보유형 기준으로 자동 분류해, "
+                "콘텐츠 제작에 바로 쓸 수 있는 데이터로 만들어 줍니다.</div>",
+                unsafe_allow_html=True,
+            )
+            if st.columns([2, 1, 2])[1].button("시작하기", key="landing_start", width="stretch"):
+                go(1)
+
+        # 하는 일 세 가지를 카드 세 장으로 나란히 둠 (히어로 영역 아래)
+        for i, (col, (icon, title, text)) in enumerate(zip(st.columns(3, gap="large"), LANDING_FEATURES)):
+            with col.container(key=f"landing_card_{i}"):
+                st.markdown(
+                    f"<div class='landing-card-icon'>{icon}</div><div class='landing-card-title'>{title}</div>",
+                    unsafe_allow_html=True,
+                )
+                st.write(text)
 
 
 # ---------- 오른쪽 아래 상담 챗봇 (PRD.md 를 읽고 서비스에 대해 답함) ----------
@@ -844,18 +955,25 @@ def chatbot():
 
 
 
-if st.session_state.page == 1:
-    page_header("데이터 올리기", "표·글 파일을 넣으면 태그가 붙은 소재 카드가 만들어집니다.")
-    screen = screen_1
-elif st.session_state.page == 2:
-    page_header("쓰인 분류 기준 확인", screen_2_description())
-    screen = screen_2
+if st.session_state.page == 0:
+    landing()
 else:
-    page_header("분류 결과", "소재 카드마다 생애주기·분야·정보유형 태그가 붙어 있습니다.")
-    screen = screen_3
+    # 기능 화면 사이드바에는 첫 화면으로 돌아가는 버튼 하나만 둠
+    if st.sidebar.button("첫 화면으로", width="stretch"):
+        go(0)
 
-# 화면마다 바뀌는 내용은 테두리 상자 안에 둠 (머리 부분은 상자 밖에서 세 화면 공통)
-with st.container(border=True):
-    screen()
+    if st.session_state.page == 1:
+        page_header("데이터 올리기", "표·글 파일을 넣으면 태그가 붙은 소재 카드가 만들어집니다.")
+        screen = screen_1
+    elif st.session_state.page == 2:
+        page_header("쓰인 분류 기준 확인", screen_2_description())
+        screen = screen_2
+    else:
+        page_header("분류 결과", "소재 카드마다 생애주기·분야·정보유형 태그가 붙어 있습니다.")
+        screen = screen_3
+
+    # 화면마다 바뀌는 내용은 테두리 상자 안에 둠 (머리 부분은 상자 밖에서 세 화면 공통)
+    with st.container(border=True):
+        screen()
 
 chatbot()
