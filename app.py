@@ -14,7 +14,7 @@ import requests
 import streamlit as st
 from PIL import Image
 
-st.set_page_config(page_title="데이터 마이그레이션")
+st.set_page_config(page_title="AI 기반 데이터 자동분류·가공 플랫폼", page_icon="💬", layout="wide")
 
 ENV_PATH = Path(__file__).parent / ".env"
 PRD_PATH = Path(__file__).parent / "PRD.md"
@@ -380,22 +380,46 @@ def go(page):
     st.rerun()
 
 
+STEPS = ["① 데이터 올리기", "② 기준 확인", "③ 분류 결과"]
+
+
+# 화면 위계 (세 화면 모두 같음)
+# 0 서비스 이름(작은 회색) → 1 화면 제목(st.title) → 2 브레드크럼(작은 글씨) → 3 화면 설명(본문)
+# → 4 구역 제목(st.subheader) → 5 구역 안 소제목(####) → 6 표 머리줄·도움말(st.caption)
+# 버튼은 다음 단계로 가는 버튼 하나만 type="primary" 로 강조
+SERVICE_NAME = "AI 기반 데이터 자동분류·가공 플랫폼"
+
+
+def page_header(title, description):
+    st.caption(SERVICE_NAME)
+    st.title(title)
+    # 타이틀 바로 밑에 지금 어느 화면인지 보여 줌 (지금 화면만 굵게)
+    st.caption(" › ".join(
+        f"**{name}**" if i == st.session_state.page else name for i, name in enumerate(STEPS, start=1)
+    ))
+    st.write(description)
+    st.divider()
+
+
 def screen_1():
-    st.title("AI 기반 데이터 자동분류·가공 플랫폼")
-    st.write("표·글 파일을 넣으면 태그가 붙은 소재 카드가 만들어집니다.")
+    st.subheader("분류할 자료 넣기")
+    # 파일 선택(왼쪽) · "또는"(가운데) · URL 입력(오른쪽)을 한 줄에 나란히 둠
+    col_file, col_or, col_url = st.columns([5, 1, 5], vertical_alignment="center")
+    with col_file:
+        uploaded_file = st.file_uploader(
+            "파일 선택 (표 또는 글 파일 1개)",
+            type=["xlsx", "csv", "docx", "txt"],
+        )
+        st.caption(".xlsx · .csv · .docx · .txt")
 
-    uploaded_file = st.file_uploader(
-        "파일 선택 (표 또는 글 파일 1개)",
-        type=["xlsx", "csv", "docx", "txt"],
-    )
-    st.caption(".xlsx · .csv · .docx · .txt")
+    col_or.markdown("<p style='text-align:center'>또는</p>", unsafe_allow_html=True)
 
-    st.markdown("<p style='text-align:center'>또는</p>", unsafe_allow_html=True)
+    with col_url:
+        url = st.text_input("게시물 URL 입력", placeholder="URL을 입력하세요 (예: https://...)")
+        st.caption("게시물 페이지 내용을 읽어와 파일처럼 분류합니다.")
 
-    url = st.text_input("게시물 URL 입력", placeholder="URL을 입력하세요 (예: https://...)")
-    st.caption("게시물 페이지 내용을 읽어와 파일처럼 분류합니다.")
-
-    if st.button("분류하기"):
+    # [분류하기]는 세 열 아래 한가운데
+    if st.columns([2, 1, 2])[1].button("분류하기", type="primary", width="stretch"):
         if uploaded_file is None and not url.strip():
             st.warning("업로드된 파일이 없습니다. 파일을 업로드 후 이용해주세요.")
             return
@@ -457,60 +481,69 @@ def screen_1():
         go(2)
 
 
-def screen_2():
-    st.title("쓰인 분류 기준 확인")
+def screen_2_description():
+    if any(c["status"] == "신규" for c in st.session_state.get("criteria", [])):
+        return "새로운 분류가 발견되었습니다. 이름을 확인하고 저장해 주세요."
+    return "이번 분류는 모두 기존 기준으로 나뉘었습니다."
 
+
+def titles_text(titles):
+    # 그 기준이 붙은 소재 제목을 앞에서부터 3개까지 보여 주고, 나머지는 "외 N건"으로 줄임
+    shown = " · ".join(titles[:3])
+    if len(titles) > 3:
+        shown += f" 외 {len(titles) - 3}건"
+    return shown
+
+
+def screen_2():
     criteria = st.session_state.get("criteria", [])
     existing_rows = [c for c in criteria if c["status"] == "기존"]
     new_rows = [c for c in criteria if c["status"] == "신규"]
 
-    if new_rows:
-        st.write("새로운 분류가 발견되었습니다. 이름을 확인하고 저장해 주세요.")
-    else:
-        st.write("이번 분류는 모두 기존 기준으로 나뉘었습니다.")
-
     st.subheader("이번 분류에 쓰인 기준 목록")
     st.caption("원래 기준과 새로 생긴 기준이 구분되어 있습니다.")
 
-    widths = [1, 4, 1]
-    head = st.columns(widths)
-    head[0].markdown("**구분**")
-    head[1].markdown("**기준 이름**")
-    head[2].markdown("**쓰인 소재 수**")
+    # 원래 기준은 왼쪽 열, 새로 생긴 기준은 오른쪽 열에 표로 나란히 둠
+    col_old, col_new = st.columns(2, gap="large")
 
-    st.markdown("**원래 기준**")
-    if not existing_rows:
-        st.caption("이번 분류에 쓰인 원래 기준이 없습니다.")
-    for c in existing_rows:
-        row = st.columns(widths)
-        row[0].write("기존")
-        row[1].write(f"{TAG_AXES[c['axis']]} : {c['name']}")
-        row[2].write(f"{c['count']}건")
+    with col_old:
+        st.markdown("#### 원래 기준")
+        if not existing_rows:
+            st.caption("이번 분류에 쓰인 원래 기준이 없습니다.")
+        else:
+            # 기존 기준은 읽기 전용 표
+            st.dataframe(pd.DataFrame([
+                {"구분": "기존", "분류 축": TAG_AXES[c["axis"]], "기준 이름": c["name"], "쓰인 소재 수": f"{c['count']}건"}
+                for c in existing_rows
+            ]), hide_index=True)
 
-    st.markdown("**새로 생긴 기준**")
-    if not new_rows:
-        st.caption("새로 생긴 기준이 없습니다.")
     edited = []
-    for c in new_rows:
-        row = st.columns(widths)
-        row[0].write("신규")
-        # 앞의 "생애주기 :" 같은 구분은 고정이고, 이름 부분만 고칠 수 있음
-        name_col = row[1].columns([1, 3])
-        name_col[0].write(f"{TAG_AXES[c['axis']]} :")
-        edited.append(name_col[1].text_input(
-            "이름 고치는 칸", value=c["name"], key=f"new_{c['axis']}_{c['name']}", label_visibility="collapsed"
-        ).strip())
-        row[2].write(f"{c['count']}건")
-        # 그 기준이 붙은 소재 제목을 앞에서부터 3개까지 보여 주고, 나머지는 "외 N건"으로 줄임
-        shown = " · ".join(c["titles"][:3])
-        if len(c["titles"]) > 3:
-            shown += f" 외 {len(c['titles']) - 3}건"
-        st.columns(widths)[1].caption("붙은 소재: " + shown)
+    with col_new:
+        st.markdown("#### 새로 생긴 기준")
+        if not new_rows:
+            st.caption("새로 생긴 기준이 없습니다.")
+        else:
+            # 신규 기준 표는 "기준 이름" 칸만 고칠 수 있고, 나머지 칸은 잠가 둠
+            table = st.data_editor(
+                pd.DataFrame([
+                    {
+                        "구분": "신규", "분류 축": TAG_AXES[c["axis"]], "기준 이름": c["name"],
+                        "쓰인 소재 수": f"{c['count']}건", "붙은 소재": titles_text(c["titles"]),
+                    }
+                    for c in new_rows
+                ]),
+                hide_index=True,
+                disabled=["구분", "분류 축", "쓰인 소재 수", "붙은 소재"],
+                column_config={"기준 이름": st.column_config.TextColumn("기준 이름 ✏️")},
+                key=f"new_criteria_{st.session_state.get('batch_id', '')}",
+            )
+            edited = [str(name or "").strip() for name in table["기준 이름"]]
+            st.caption("기준 이름 ✏️ 칸을 두 번 눌러 이름을 고칩니다.")
 
-    st.caption("신규 기준만 이름을 고칠 수 있음 · 기존 기준은 읽기 전용")
-
-    col_save, col_next = st.columns([1, 3])
-    if col_save.button("저장"):
+    # 맨 아래 한 줄: 안내 · [저장] · [결과화면 보기]
+    col_note, col_save, col_next = st.columns([4, 1, 1], vertical_alignment="center")
+    col_note.caption("신규 기준만 이름을 고칠 수 있음 · 기존 기준은 읽기 전용")
+    if col_save.button("저장", width="stretch"):
         if any(not name for name in edited):
             st.warning("기준 이름을 비워 둘 수 없습니다.")
         else:
@@ -523,41 +556,44 @@ def screen_2():
                 st.error(f"Supabase에 저장하지 못했습니다: {error_text(e)}")
             else:
                 st.success("새로 생긴 기준의 이름을 저장했습니다.")
-    if col_next.button("결과화면 보기"):
+    if col_next.button("결과화면 보기", type="primary", width="stretch"):
         go(3)
 
 
 def screen_3():
-    st.title("분류 결과")
-
     try:
         rows = fetch_rows(st.session_state.get("batch_id", ""))
     except requests.RequestException as e:
         st.error(f"Supabase에서 결과를 불러오지 못했습니다: {error_text(e)}")
         rows = []
 
-    if rows:
-        st.write(f"소재 카드 {len(rows)}장 ({rows[0]['source_name']})")
-    else:
-        st.write("Supabase에 저장된 결과가 없습니다.")
-    st.caption("Supabase classification_results 표에 저장된 내용입니다. 태그는 AI가 분류했고, 고치는 기능은 없습니다.")
-
-    for row in rows:
-        with st.container(border=True):
-            st.markdown(f"**{row['title'] or row['content'][:50]}**")
-            st.caption(row["content"][:200])
-            st.markdown(
-                f"`생애주기 : {row['lifecycle']}` `분야 : {row['field']}` `정보유형 : {row['info_type']}`"
-            )
-
     df = pd.DataFrame(rows, columns=["item_order", "title", "content", "lifecycle", "field", "info_type", "source_name"])
     df.columns = ["순서", "제목", "내용", "생애주기", "분야", "정보유형", "출처"]
     csv_data = df.to_csv(index=False).encode("utf-8-sig")
 
-    col_down, col_home = st.columns([1, 3])
-    col_down.download_button("다운로드", data=csv_data, file_name="분류결과.csv", mime="text/csv")
-    if col_home.button("처음 화면으로"):
+    # 맨 위 한 줄: 카드 수·출처 · [다운로드] · [처음 화면으로]
+    col_count, col_down, col_home = st.columns([4, 1, 1], vertical_alignment="center")
+    if rows:
+        col_count.subheader(f"소재 카드 {len(rows)}장 ({rows[0]['source_name']})")
+    else:
+        col_count.subheader("Supabase에 저장된 결과가 없습니다.")
+    col_down.download_button(
+        "다운로드", data=csv_data, file_name="분류결과.csv", mime="text/csv", type="primary", width="stretch"
+    )
+    if col_home.button("처음 화면으로", width="stretch"):
         go(1)
+    st.caption("Supabase classification_results 표에 저장된 내용입니다. 태그는 AI가 분류했고, 고치는 기능은 없습니다.")
+
+    # 카드는 3열 격자로, 높이를 고정한 상자 안에서만 스크롤되게 함
+    with st.container(height=520, border=False):
+        grid = st.columns(3)
+        for i, row in enumerate(rows):
+            with grid[i % 3].container(border=True):
+                st.markdown(f"**{row['title'] or row['content'][:50]}**")
+                st.caption(row["content"][:200])
+                st.markdown(
+                    f"`생애주기 : {row['lifecycle']}` `분야 : {row['field']}` `정보유형 : {row['info_type']}`"
+                )
 
 
 # ---------- 오른쪽 아래 상담 챗봇 (PRD.md 를 읽고 서비스에 대해 답함) ----------
@@ -807,16 +843,19 @@ def chatbot():
             st.rerun()
 
 
-st.sidebar.write(
-    "표·글 파일이나 게시물 URL을 넣으면 생애주기·분야·정보유형 기준으로 자동 분류해, "
-    "콘텐츠 제작에 바로 쓸 수 있는 데이터로 만들어 줍니다."
-)
 
 if st.session_state.page == 1:
-    screen_1()
+    page_header("데이터 올리기", "표·글 파일을 넣으면 태그가 붙은 소재 카드가 만들어집니다.")
+    screen = screen_1
 elif st.session_state.page == 2:
-    screen_2()
+    page_header("쓰인 분류 기준 확인", screen_2_description())
+    screen = screen_2
 else:
-    screen_3()
+    page_header("분류 결과", "소재 카드마다 생애주기·분야·정보유형 태그가 붙어 있습니다.")
+    screen = screen_3
+
+# 화면마다 바뀌는 내용은 테두리 상자 안에 둠 (머리 부분은 상자 밖에서 세 화면 공통)
+with st.container(border=True):
+    screen()
 
 chatbot()
