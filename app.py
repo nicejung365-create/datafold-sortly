@@ -4,6 +4,7 @@ import re
 import uuid
 import zipfile
 import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
 from pathlib import Path
 
 import base64
@@ -188,15 +189,19 @@ def classify_items(api_key, items, criteria):
     return [tags[no] for no, _ in numbered]
 
 
-def used_criteria(tag_list, existing):
-    # 이번 분류에 쓰인 기준 목록: [{"axis", "name", "status", "count"}, ...]
-    counts = {}
-    for tags in tag_list:
+def used_criteria(items, tag_list, existing):
+    # 이번 분류에 쓰인 기준 목록: [{"axis", "name", "status", "count", "titles"}, ...]
+    # titles 는 그 기준이 붙은 소재 제목 (올린 순서대로, 제목이 없으면 화면 3 카드처럼 내용 앞부분)
+    titles = {}
+    for (title, content), tags in zip(items, tag_list):
         for axis in TAG_AXES:
-            counts[(axis, tags[axis])] = counts.get((axis, tags[axis]), 0) + 1
+            titles.setdefault((axis, tags[axis]), []).append(title or content[:50])
     rows = [
-        {"axis": axis, "name": name, "status": "기존" if name in existing[axis] else "신규", "count": n}
-        for (axis, name), n in counts.items()
+        {
+            "axis": axis, "name": name, "status": "기존" if name in existing[axis] else "신규",
+            "count": len(names), "titles": names,
+        }
+        for (axis, name), names in titles.items()
     ]
     order = list(TAG_AXES)
     return sorted(rows, key=lambda r: (order.index(r["axis"]), r["name"]))
@@ -292,6 +297,65 @@ def file_items(uploaded_file):
     return document_items(decode_text(data))
 
 
+# ---------- 게시물 URL 페이지를 소재 목록(제목, 내용)으로 바꾸기 ----------
+
+class PageText(HTMLParser):
+    # 페이지의 <title> 과 본문 글자를 모음 — 스크립트·메뉴·머리말·바닥글 안의 글자는 뺌
+    SKIP = {"script", "style", "noscript", "template", "svg", "nav", "header", "footer", "aside", "form"}
+    BLOCK = {"p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "article", "section", "td", "th"}
+
+    def __init__(self):
+        super().__init__()
+        self.title = ""
+        self.lines = [""]
+        self.skip_depth = 0
+        self.in_title = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP:
+            self.skip_depth += 1
+        elif tag == "title":
+            self.in_title = True
+        elif tag in self.BLOCK:
+            self.lines.append("")
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP:
+            self.skip_depth = max(0, self.skip_depth - 1)
+        elif tag == "title":
+            self.in_title = False
+        elif tag in self.BLOCK:
+            self.lines.append("")
+
+    def handle_data(self, data):
+        if self.in_title:
+            self.title += data
+        elif not self.skip_depth:
+            self.lines[-1] += data
+
+    def text(self):
+        lines = (" ".join(line.split()) for line in self.lines)
+        return "\n".join(line for line in lines if line)
+
+
+def url_items(url):
+    # URL 페이지는 글 파일처럼 페이지 하나가 소재 1건 — 제목은 페이지 <title>(없으면 본문 첫 줄)
+    res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+    res.raise_for_status()
+    # 응답에 글자 인코딩이 안 적혀 있으면 requests 가 ISO-8859-1 로 읽어 한글이 깨지므로, 내용으로 추정한 인코딩을 씀
+    if "charset" not in res.headers.get("Content-Type", "").lower():
+        res.encoding = res.apparent_encoding
+    page = PageText()
+    page.feed(res.text)
+    text = page.text()
+    if not text:
+        return []
+    title = " ".join(page.title.split())
+    if not title:
+        return document_items(text)
+    return [(title[:100], text)]
+
+
 def make_rows(batch_id, source_type, source_name, items, tag_list):
     return [
         {
@@ -348,12 +412,21 @@ def screen_1():
                 return
             source_type, source_name = "file", uploaded_file.name
         else:
-            # URL 페이지 내용 읽기 방법은 아직 정하지 않아, 지금은 URL 자체를 소재 1건으로 분류
-            items = [(url.strip(), url.strip())]
+            if not re.match(r"https?://", url.strip()):
+                st.warning("URL은 http:// 또는 https:// 로 시작해야 합니다.")
+                return
+            try:
+                items = url_items(url.strip())
+            except requests.RequestException as e:
+                st.error(f"페이지를 읽어 오지 못했습니다: {error_text(e)}")
+                return
             source_type, source_name = "url", url.strip()
 
         if not items:
-            st.warning("파일에서 읽어 온 내용이 없습니다. 다른 파일을 올려 주세요.")
+            if source_type == "url":
+                st.warning("페이지에서 읽어 온 내용이 없습니다. 다른 URL을 넣어 주세요.")
+            else:
+                st.warning("파일에서 읽어 온 내용이 없습니다. 다른 파일을 올려 주세요.")
             return
 
         try:
@@ -380,7 +453,7 @@ def screen_1():
             return
 
         st.session_state.batch_id = batch_id
-        st.session_state.criteria = used_criteria(tag_list, existing)
+        st.session_state.criteria = used_criteria(items, tag_list, existing)
         go(2)
 
 
@@ -428,6 +501,11 @@ def screen_2():
             "이름 고치는 칸", value=c["name"], key=f"new_{c['axis']}_{c['name']}", label_visibility="collapsed"
         ).strip())
         row[2].write(f"{c['count']}건")
+        # 그 기준이 붙은 소재 제목을 앞에서부터 3개까지 보여 주고, 나머지는 "외 N건"으로 줄임
+        shown = " · ".join(c["titles"][:3])
+        if len(c["titles"]) > 3:
+            shown += f" 외 {len(c['titles']) - 3}건"
+        st.columns(widths)[1].caption("붙은 소재: " + shown)
 
     st.caption("신규 기준만 이름을 고칠 수 있음 · 기존 기준은 읽기 전용")
 
