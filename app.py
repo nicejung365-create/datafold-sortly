@@ -4,7 +4,6 @@ import re
 import uuid
 import zipfile
 import xml.etree.ElementTree as ET
-from html.parser import HTMLParser
 from pathlib import Path
 
 import base64
@@ -14,22 +13,20 @@ import requests
 import streamlit as st
 from PIL import Image
 
+# 고정 기준(대상·분야·정보유형)으로 분류하고 키워드를 붙이는 부분 — remap_fixed.py 와 함께 씀
+from classifier import (
+    FIXED_CRITERIA, GEMINI_MODEL, TAG_AXES, call_gemini, classify_items, split_names,
+)
+# 게시물 URL 을 크롤링해 AI 로 제목·본문·요약을 정리하는 부분
+from crawler import MAX_POSTS, CrawlError, crawl
+
 st.set_page_config(page_title="AI 기반 데이터 자동분류·가공 플랫폼", page_icon="💬", layout="wide")
 
 ENV_PATH = Path(__file__).parent / ".env"
 PRD_PATH = Path(__file__).parent / "PRD.md"
 TABLE = "classification_results"
-NOT_CLASSIFIED = "분류 전"
-
-# helper.py 와 같은 방식 — 공식 문서(ai.google.dev/gemini-api/docs/interactions, structured-output)의 REST 호출
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
-# 문서 예시 모델(gemini-3.8-flash)은 이 키로 응답이 오지 않아, 응답이 확인된 모델을 씀
-GEMINI_MODEL = "gemini-3.5-flash-lite"
-CHUNK_SIZE = 20  # 한 번에 AI 에게 보내는 소재 수
-
-TAG_AXES = {"lifecycle": "생애주기", "field": "분야", "info_type": "정보유형"}
-# Supabase 에 아직 결과가 없을 때 참고할 처음 기준
-BASE_CRITERIA = {"lifecycle": ["전체", "청년"], "field": ["일자리"], "info_type": []}
+# keywords·summary 칸이 없는 표에 저장·조회할 때 안내할 SQL 파일
+NEW_COLUMNS_SQL = "data/new_columns.sql"
 
 XLSX_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 DOCX_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
@@ -56,7 +53,10 @@ GEMINI_API_KEY = env.get("GEMINI_API_KEY", "")
 
 def error_text(e):
     if e.response is not None and e.response.text:
-        return f"{e} — {e.response.text}"
+        text = f"{e} — {e.response.text}"
+        if "keywords" in e.response.text or "summary" in e.response.text:
+            text += f"\n\n→ Supabase 표에 keywords·summary 칸이 없습니다. {NEW_COLUMNS_SQL} 을 SQL Editor 에서 한 번 실행해 주세요."
+        return text
     return str(e)
 
 
@@ -65,27 +65,29 @@ def save_rows(rows):
     res.raise_for_status()
 
 
+ROW_FIELDS = "item_order,source_name,title,content,lifecycle,field,info_type,keywords,summary"
+
+
 def fetch_rows(batch_id):
-    params = {
-        "select": "item_order,source_name,title,content,lifecycle,field,info_type",
-        "batch_id": f"eq.{batch_id}",
-        "order": "item_order.asc",
-    }
+    params = {"select": ROW_FIELDS, "batch_id": f"eq.{batch_id}", "order": "item_order.asc"}
     res = requests.get(BASE_URL, headers=HEADERS, params=params, timeout=10)
     res.raise_for_status()
     return res.json()
 
 
-def fetch_existing_criteria():
-    # 이전에 Supabase 에 저장된 태그 이름 = 기존 기준
-    res = requests.get(BASE_URL, headers=HEADERS, params={"select": ",".join(TAG_AXES)}, timeout=10)
-    res.raise_for_status()
-    criteria = {axis: set(names) for axis, names in BASE_CRITERIA.items()}
-    for row in res.json():
-        for axis in TAG_AXES:
-            if row[axis] and row[axis] != NOT_CLASSIFIED:
-                criteria[axis].add(row[axis])
-    return criteria
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_all_rows():
+    # 지금까지 쌓인 모든 결과 (최근 분류부터) — 화면 3 필터를 누를 때마다 다시 부르지 않게 1분간 기억해 둠
+    rows, start, page = [], 0, 1000
+    while True:
+        params = {"select": ROW_FIELDS, "order": "created_at.desc,item_order.asc"}
+        headers = {**HEADERS, "Range": f"{start}-{start + page - 1}"}
+        res = requests.get(BASE_URL, headers=headers, params=params, timeout=30)
+        res.raise_for_status()
+        rows += res.json()
+        if len(res.json()) < page:
+            return rows
+        start += page
 
 
 def rename_criterion(batch_id, axis, old_name, new_name):
@@ -94,117 +96,39 @@ def rename_criterion(batch_id, axis, old_name, new_name):
     res.raise_for_status()
 
 
-# ---------- Gemini 로 생애주기·분야·정보유형 분류하기 ----------
+# ---------- 이번 분류에 쓰인 고정 기준·키워드 정리하기 ----------
 
-CLASSIFY_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "results": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "no": {"type": "integer"},
-                    "lifecycle": {"type": "string"},
-                    "field": {"type": "string"},
-                    "info_type": {"type": "string"},
-                },
-                "required": ["no", "lifecycle", "field", "info_type"],
-            },
-        }
-    },
-    "required": ["results"],
-}
-
-
-def ask_gemini(api_key, message):
-    return call_gemini(api_key, {
-        "model": GEMINI_MODEL,
-        "input": message,
-        "response_format": {"type": "text", "mime_type": "application/json", "schema": CLASSIFY_SCHEMA},
-    })
-
-
-def call_gemini(api_key, body):
-    headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
-    res = requests.post(GEMINI_URL, headers=headers, json=body, timeout=120)
-    res.raise_for_status()
-    # 답은 steps 중 type 이 "model_output" 인 단계의 content 안 text 에 들어 있음
-    texts = [
-        part.get("text", "")
-        for step in res.json().get("steps", [])
-        if step.get("type") == "model_output"
-        for part in step.get("content", [])
-        if part.get("type") == "text"
-    ]
-    return "".join(texts)
-
-
-def classify_prompt(items, criteria):
-    lines = [
-        "너는 콘텐츠 제작용 데이터를 분류하는 도우미다.",
-        "아래 소재마다 생애주기(lifecycle)·분야(field)·정보유형(info_type)을 하나씩 정해라.",
-        "- 기존 기준은 소재 내용과 정확히 들어맞을 때만 그 이름을 글자 그대로 써라.",
-        "- 비슷해 보인다는 이유로 기존 기준을 억지로 고르지 마라. 들어맞는 기존 기준이 없거나 애매하면, "
-        "내용을 잘 나타내는 짧은 한국어 이름(2~8글자)을 새로 지어라.",
-        "- 생애주기는 글에 특정 연령·대상(예: 영유아, 청소년, 청년, 어르신)이 드러날 때만 그 대상으로 하고, "
-        "드러나지 않으면 '전체'로 하라.",
-        "- 분야는 소재가 다루는 주제(예: 체육, 문화, 환경, 주거, 교통)로 정하라.",
-        "- 모든 소재에 대해 no 를 그대로 붙여 답하라.",
-        "",
-        "[기존 기준]",
-    ]
-    for axis, label in TAG_AXES.items():
-        names = ", ".join(sorted(criteria[axis])) or "(없음)"
-        lines.append(f"{label}({axis}): {names}")
-    lines += ["", "[소재]"]
-    for no, (title, content) in items:
-        lines.append(f"no {no}. 제목: {title} / 내용: {content[:1000]}")
-    return "\n".join(lines)
-
-
-def classify_items(api_key, items, criteria):
-    # items: [(제목, 내용), ...] → 같은 순서로 [{"lifecycle":..., "field":..., "info_type":...}, ...]
-    criteria = {axis: set(names) for axis, names in criteria.items()}
-    numbered = list(enumerate(items, start=1))
-    tags = {}
-    for start in range(0, len(numbered), CHUNK_SIZE):
-        chunk = numbered[start:start + CHUNK_SIZE]
-        answer = json.loads(ask_gemini(api_key, classify_prompt(chunk, criteria)))
-        # "행사 안내"/"행사안내"처럼 띄어쓰기만 다른 이름은 기존 기준 이름으로 맞춤
-        same_name = {axis: {name.replace(" ", ""): name for name in criteria[axis]} for axis in TAG_AXES}
-        for r in answer.get("results", []):
-            tags[r["no"]] = {}
-            for axis in TAG_AXES:
-                name = (r.get(axis) or "").strip() or NOT_CLASSIFIED
-                tags[r["no"]][axis] = same_name[axis].setdefault(name.replace(" ", ""), name)
-        # 앞 묶음에서 새로 만든 기준을 다음 묶음에서도 참고하게 함
-        for no, _ in chunk:
-            for axis in TAG_AXES:
-                if no in tags:
-                    criteria[axis].add(tags[no][axis])
-    missing = [no for no, _ in numbered if no not in tags]
-    if missing:
-        raise ValueError(f"AI 답에 {missing} 번 소재의 분류가 빠졌습니다. 다시 눌러 주세요.")
-    return [tags[no] for no, _ in numbered]
-
-
-def used_criteria(items, tag_list, existing):
+def used_criteria(items, tag_list):
     # 이번 분류에 쓰인 기준 목록: [{"axis", "name", "status", "count", "titles"}, ...]
+    # status 는 고정 기준이면 "기존", 고정 기준에 없는 이름(AI 가 목록 밖 이름을 답한 경우)이면 "신규"
     # titles 는 그 기준이 붙은 소재 제목 (올린 순서대로, 제목이 없으면 화면 3 카드처럼 내용 앞부분)
     titles = {}
     for (title, content), tags in zip(items, tag_list):
         for axis in TAG_AXES:
-            titles.setdefault((axis, tags[axis]), []).append(title or content[:50])
+            # 대상은 여러 개를 고를 수 있어, 고른 대상마다 따로 셈
+            for name in split_names(tags[axis]) if axis == "lifecycle" else [tags[axis]]:
+                titles.setdefault((axis, name), []).append(title or content[:50])
     rows = [
         {
-            "axis": axis, "name": name, "status": "기존" if name in existing[axis] else "신규",
+            "axis": axis, "name": name, "status": "기존" if name in FIXED_CRITERIA[axis] else "신규",
             "count": len(names), "titles": names,
         }
         for (axis, name), names in titles.items()
     ]
+    # 고정 기준 목록 순서대로 보여 줌
     order = list(TAG_AXES)
-    return sorted(rows, key=lambda r: (order.index(r["axis"]), r["name"]))
+    rank = lambda r: FIXED_CRITERIA[r["axis"]].index(r["name"]) if r["name"] in FIXED_CRITERIA[r["axis"]] else 99
+    return sorted(rows, key=lambda r: (order.index(r["axis"]), rank(r), r["name"]))
+
+
+def used_keywords(items, tag_list):
+    # 이번 분류에 붙은 키워드 목록: [{"name", "count", "titles"}, ...] (많이 붙은 키워드부터)
+    titles = {}
+    for (title, content), tags in zip(items, tag_list):
+        for word in split_names(tags["keywords"]):
+            titles.setdefault(word, []).append(title or content[:50])
+    rows = [{"name": word, "count": len(names), "titles": names} for word, names in titles.items()]
+    return sorted(rows, key=lambda r: (-r["count"], r["name"]))
 
 
 # ---------- 올린 파일을 소재 목록(제목, 내용)으로 바꾸기 ----------
@@ -297,77 +221,23 @@ def file_items(uploaded_file):
     return document_items(decode_text(data))
 
 
-# ---------- 게시물 URL 페이지를 소재 목록(제목, 내용)으로 바꾸기 ----------
-
-class PageText(HTMLParser):
-    # 페이지의 <title> 과 본문 글자를 모음 — 스크립트·메뉴·머리말·바닥글 안의 글자는 뺌
-    SKIP = {"script", "style", "noscript", "template", "svg", "nav", "header", "footer", "aside", "form"}
-    BLOCK = {"p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "article", "section", "td", "th"}
-
-    def __init__(self):
-        super().__init__()
-        self.title = ""
-        self.lines = [""]
-        self.skip_depth = 0
-        self.in_title = False
-
-    def handle_starttag(self, tag, attrs):
-        if tag in self.SKIP:
-            self.skip_depth += 1
-        elif tag == "title":
-            self.in_title = True
-        elif tag in self.BLOCK:
-            self.lines.append("")
-
-    def handle_endtag(self, tag):
-        if tag in self.SKIP:
-            self.skip_depth = max(0, self.skip_depth - 1)
-        elif tag == "title":
-            self.in_title = False
-        elif tag in self.BLOCK:
-            self.lines.append("")
-
-    def handle_data(self, data):
-        if self.in_title:
-            self.title += data
-        elif not self.skip_depth:
-            self.lines[-1] += data
-
-    def text(self):
-        lines = (" ".join(line.split()) for line in self.lines)
-        return "\n".join(line for line in lines if line)
-
-
-def url_items(url):
-    # URL 페이지는 글 파일처럼 페이지 하나가 소재 1건 — 제목은 페이지 <title>(없으면 본문 첫 줄)
-    res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-    res.raise_for_status()
-    # 응답에 글자 인코딩이 안 적혀 있으면 requests 가 ISO-8859-1 로 읽어 한글이 깨지므로, 내용으로 추정한 인코딩을 씀
-    if "charset" not in res.headers.get("Content-Type", "").lower():
-        res.encoding = res.apparent_encoding
-    page = PageText()
-    page.feed(res.text)
-    text = page.text()
-    if not text:
-        return []
-    title = " ".join(page.title.split())
-    if not title:
-        return document_items(text)
-    return [(title[:100], text)]
-
-
-def make_rows(batch_id, source_type, source_name, items, tag_list):
+def make_rows(batch_id, source_type, sources, items, tag_list, summaries):
+    # sources: 소재마다의 출처 (파일은 파일 이름, URL 크롤링은 게시물마다의 주소)
+    # summaries: 소재마다의 AI 요약 (파일은 빈 글자)
     return [
         {
             "batch_id": batch_id,
             "source_type": source_type,
-            "source_name": source_name,
+            "source_name": source,
             "item_order": i,
             "title": title or None,
             "content": content,
+            "summary": summary or None,
             **tags,
         }
-        for i, ((title, content), tags) in enumerate(zip(items, tag_list), start=1)
+        for i, ((title, content), tags, source, summary) in enumerate(
+            zip(items, tag_list, sources, summaries), start=1
+        )
     ]
 
 
@@ -417,7 +287,10 @@ def screen_1():
 
     with col_url:
         url = st.text_input("게시물 URL 입력", placeholder="URL을 입력하세요 (예: https://...)")
-        st.caption("게시물 페이지 내용을 읽어와 파일처럼 분류합니다.")
+        st.caption(
+            f"게시판 목록 주소를 넣으면 게시물을 최대 {MAX_POSTS}건까지 읽어 와, AI가 제목·본문·요약을 정리한 뒤 분류합니다. "
+            "글 하나의 주소를 넣으면 그 글만 읽습니다."
+        )
 
     # [분류하기]는 세 열 아래 한가운데
     if st.columns([2, 1, 2])[1].button("분류하기", type="primary", width="stretch"):
@@ -436,16 +309,32 @@ def screen_1():
                 st.error(f"파일을 읽지 못했습니다: {e}")
                 return
             source_type, source_name = "file", uploaded_file.name
+            sources, summaries = [source_name] * len(items), [""] * len(items)
         else:
             if not re.match(r"https?://", url.strip()):
                 st.warning("URL은 http:// 또는 https:// 로 시작해야 합니다.")
                 return
-            try:
-                items = url_items(url.strip())
-            except requests.RequestException as e:
-                st.error(f"페이지를 읽어 오지 못했습니다: {error_text(e)}")
-                return
             source_type, source_name = "url", url.strip()
+            # 사이트를 크롤링하고 AI 가 게시물마다 제목·본문·요약을 정리함 (진행 상황을 한 줄씩 보여 줌)
+            with st.status("사이트에서 게시물을 읽어 오는 중입니다...") as status:
+                try:
+                    posts = crawl(source_name, GEMINI_API_KEY, progress=lambda text: status.update(label=text))
+                except CrawlError as e:
+                    status.update(label="읽어 오지 못했습니다", state="error")
+                    st.warning(str(e))
+                    return
+                except requests.RequestException as e:
+                    status.update(label="읽어 오지 못했습니다", state="error")
+                    st.error(f"페이지를 읽어 오지 못했습니다: {error_text(e)}")
+                    return
+                except (ValueError, KeyError, TypeError) as e:
+                    status.update(label="정리하지 못했습니다", state="error")
+                    st.error(f"AI 정리 답을 읽지 못했습니다: {e}")
+                    return
+                status.update(label=f"게시물 {len(posts)}건을 읽어 정리했습니다", state="complete")
+            items = [(p["title"], p["body"]) for p in posts]
+            sources = [p["url"] for p in posts]
+            summaries = [p["summary"] for p in posts]
 
         if not items:
             if source_type == "url":
@@ -454,15 +343,10 @@ def screen_1():
                 st.warning("파일에서 읽어 온 내용이 없습니다. 다른 파일을 올려 주세요.")
             return
 
-        try:
-            existing = fetch_existing_criteria()
-        except requests.RequestException as e:
-            st.error(f"Supabase에서 기존 기준을 불러오지 못했습니다: {error_text(e)}")
-            return
-
+        # AI 는 고정 기준(대상·분야·정보유형) 안에서만 고르고, 부족한 내용은 키워드로 붙임
         with st.spinner(f"AI가 소재 {len(items)}건을 분류하는 중입니다..."):
             try:
-                tag_list = classify_items(GEMINI_API_KEY, items, existing)
+                tag_list = classify_items(GEMINI_API_KEY, items)
             except requests.RequestException as e:
                 st.error(f"AI 분류를 받지 못했습니다: {error_text(e)}")
                 return
@@ -472,20 +356,23 @@ def screen_1():
 
         batch_id = str(uuid.uuid4())
         try:
-            save_rows(make_rows(batch_id, source_type, source_name, items, tag_list))
+            save_rows(make_rows(batch_id, source_type, sources, items, tag_list, summaries))
+            fetch_all_rows.clear()  # 새 결과가 '지금까지 쌓인 전체'에 바로 보이게
         except requests.RequestException as e:
             st.error(f"Supabase에 저장하지 못했습니다: {error_text(e)}")
             return
 
         st.session_state.batch_id = batch_id
-        st.session_state.criteria = used_criteria(items, tag_list, existing)
+        st.session_state.source_name = source_name  # 화면 3 맨 위에 보여 줄, 넣은 파일 이름·URL
+        st.session_state.criteria = used_criteria(items, tag_list)
+        st.session_state.keywords = used_keywords(items, tag_list)
         go(2)
 
 
 def screen_2_description():
     if any(c["status"] == "신규" for c in st.session_state.get("criteria", [])):
-        return "새로운 분류가 발견되었습니다. 이름을 확인하고 저장해 주세요."
-    return "이번 분류는 모두 기존 기준으로 나뉘었습니다."
+        return "고정 기준에 없는 이름이 나왔습니다. 고정 기준 이름으로 고쳐 저장해 주세요."
+    return "이번 분류는 모두 고정 기준으로 나뉘었습니다. 고정 기준에 담기지 않은 내용은 키워드로 붙였습니다."
 
 
 def titles_text(titles):
@@ -501,29 +388,40 @@ def screen_2():
     existing_rows = [c for c in criteria if c["status"] == "기존"]
     new_rows = [c for c in criteria if c["status"] == "신규"]
 
-    st.subheader("이번 분류에 쓰인 기준 목록")
-    st.caption("원래 기준과 새로 생긴 기준이 구분되어 있습니다.")
+    keywords = st.session_state.get("keywords", [])
 
-    # 원래 기준은 왼쪽 열, 새로 생긴 기준은 오른쪽 열에 표로 나란히 둠
+    st.subheader("이번 분류에 쓰인 기준 목록")
+    st.caption("고정 기준(대상·분야·정보유형)과, 고정 기준에 담기지 않아 붙인 키워드가 구분되어 있습니다.")
+
+    # 고정 기준은 왼쪽 열, 키워드는 오른쪽 열에 표로 나란히 둠
     col_old, col_new = st.columns(2, gap="large")
 
     with col_old:
-        st.markdown("#### 원래 기준")
+        st.markdown("#### 고정 기준")
         if not existing_rows:
-            st.caption("이번 분류에 쓰인 원래 기준이 없습니다.")
+            st.caption("이번 분류에 쓰인 고정 기준이 없습니다.")
         else:
-            # 기존 기준은 읽기 전용 표
+            # 고정 기준은 읽기 전용 표
             st.dataframe(pd.DataFrame([
-                {"구분": "기존", "분류 축": TAG_AXES[c["axis"]], "기준 이름": c["name"], "쓰인 소재 수": f"{c['count']}건"}
+                {"구분": "고정", "분류 축": TAG_AXES[c["axis"]], "기준 이름": c["name"], "쓰인 소재 수": f"{c['count']}건"}
                 for c in existing_rows
             ]), hide_index=True)
 
     edited = []
     with col_new:
-        st.markdown("#### 새로 생긴 기준")
-        if not new_rows:
-            st.caption("새로 생긴 기준이 없습니다.")
+        st.markdown("#### 키워드")
+        if not keywords:
+            st.caption("이번 분류에 붙은 키워드가 없습니다.")
         else:
+            # 키워드는 읽기 전용 표
+            st.dataframe(pd.DataFrame([
+                {"키워드": k["name"], "쓰인 소재 수": f"{k['count']}건", "붙은 소재": titles_text(k["titles"])}
+                for k in keywords
+            ]), hide_index=True)
+
+        # AI 가 고정 기준 목록 밖의 이름을 답했을 때만 나옴 — 고정 기준 이름으로 고쳐 저장할 수 있음
+        if new_rows:
+            st.markdown("#### 고정 기준에 없는 이름")
             # 신규 기준 표는 "기준 이름" 칸만 고칠 수 있고, 나머지 칸은 잠가 둠
             table = st.data_editor(
                 pd.DataFrame([
@@ -543,7 +441,7 @@ def screen_2():
 
     # 맨 아래 한 줄: 안내 · [저장] · [결과화면 보기]
     col_note, col_save, col_next = st.columns([4, 1, 1], vertical_alignment="center")
-    col_note.caption("신규 기준만 이름을 고칠 수 있음 · 기존 기준은 읽기 전용")
+    col_note.caption("고정 기준과 키워드는 읽기 전용 · 고정 기준에 없는 이름만 고칠 수 있음")
     if col_save.button("저장", width="stretch"):
         if any(not name for name in edited):
             st.warning("기준 이름을 비워 둘 수 없습니다.")
@@ -552,49 +450,128 @@ def screen_2():
                 for c, name in zip(new_rows, edited):
                     if name != c["name"]:
                         rename_criterion(st.session_state.batch_id, c["axis"], c["name"], name)
+                        fetch_all_rows.clear()
                         c["name"] = name
             except requests.RequestException as e:
                 st.error(f"Supabase에 저장하지 못했습니다: {error_text(e)}")
             else:
-                st.success("새로 생긴 기준의 이름을 저장했습니다.")
+                st.success("고친 기준 이름을 저장했습니다." if new_rows else "고칠 기준 이름이 없습니다.")
     if col_next.button("결과화면 보기", type="primary", width="stretch"):
         go(3)
 
 
+SCOPE_THIS, SCOPE_ALL = "이번 분류 결과", "지금까지 쌓인 전체"
+FILTER_KEYS = {axis: f"filter_{axis}" for axis in TAG_AXES}
+
+
+def row_names(row, axis):
+    # 소재 하나에 붙은 기준 이름들 (대상은 여러 개일 수 있음)
+    return split_names(row.get(axis)) if axis == "lifecycle" else [row.get(axis) or ""]
+
+
+def filter_options(rows, axis):
+    # 이 범위의 결과에 실제로 나온 기준 이름과 건수 — 고정 기준 순서대로, 고정 기준에 없는 이름(예전 결과)은 뒤에
+    counts = {}
+    for row in rows:
+        for name in row_names(row, axis):
+            if name:
+                counts[name] = counts.get(name, 0) + 1
+    fixed = FIXED_CRITERIA[axis]
+    return dict(sorted(counts.items(), key=lambda kv: (fixed.index(kv[0]) if kv[0] in fixed else 99, kv[0])))
+
+
+def clear_filters():
+    for key in FILTER_KEYS.values():
+        st.session_state[key] = []
+
+
+def to_csv(rows):
+    df = pd.DataFrame(
+        rows,
+        columns=["item_order", "title", "summary", "content", "lifecycle", "field", "info_type", "keywords", "source_name"],
+    )
+    df.columns = ["순서", "제목", "요약", "내용", "대상", "분야", "정보유형", "키워드", "출처"]
+    return df.to_csv(index=False).encode("utf-8-sig")
+
+
 def screen_3():
+    # 맨 위 줄(카드 수·다운로드)은 필터 결과를 알아야 채울 수 있어, 자리만 먼저 잡아 두고 아래에서 채움
+    top = st.container()
+
+    # ---- 카드 바로 위 한 줄: 보는 범위 · 대상 · 분야 · 정보유형 필터 · 초기화 ----
+    filter_cols = st.columns([1.3, 2, 2, 2, 0.8], vertical_alignment="bottom")
+    scope = filter_cols[0].selectbox("보는 범위", [SCOPE_THIS, SCOPE_ALL], key="filter_scope")
+
     try:
-        rows = fetch_rows(st.session_state.get("batch_id", ""))
+        if scope == SCOPE_THIS:
+            rows = fetch_rows(st.session_state.get("batch_id", ""))
+        else:
+            rows = fetch_all_rows()
     except requests.RequestException as e:
         st.error(f"Supabase에서 결과를 불러오지 못했습니다: {error_text(e)}")
         rows = []
 
-    df = pd.DataFrame(rows, columns=["item_order", "title", "content", "lifecycle", "field", "info_type", "source_name"])
-    df.columns = ["순서", "제목", "내용", "생애주기", "분야", "정보유형", "출처"]
-    csv_data = df.to_csv(index=False).encode("utf-8-sig")
+    picked = {}
+    for col, (axis, label) in zip(filter_cols[1:4], TAG_AXES.items()):
+        options = filter_options(rows, axis)
+        key = FILTER_KEYS[axis]
+        # 범위를 바꿔 목록에서 사라진 이름은 고른 값에서 뺌 (없는 이름이 남아 있으면 칸이 오류를 냄)
+        st.session_state[key] = [v for v in st.session_state.get(key, []) if v in options]
+        picked[axis] = col.multiselect(
+            label, list(options), key=key, placeholder="전체",
+            format_func=lambda name, options=options: f"{name} ({options[name]})",
+        )
+    filter_cols[4].button("초기화", on_click=clear_filters, width="stretch")
 
-    # 맨 위 한 줄: 카드 수·출처 · [다운로드] · [처음 화면으로]
-    col_count, col_down, col_home = st.columns([4, 1, 1], vertical_alignment="center")
+    # 한 칸 안에서 여러 개를 고르면 "이 중 하나라도", 여러 칸을 함께 고르면 "모두 만족"
+    shown = [
+        row for row in rows
+        if all(not names or set(row_names(row, axis)) & set(names) for axis, names in picked.items())
+    ]
+    filtered = any(picked.values())
+
+    # ---- 맨 위 줄: 카드 수·출처 · [전체 다운로드] · [거른 것만 다운로드] · [처음 화면으로] ----
+    col_count, col_all, col_some, col_home = top.columns([3.4, 1, 1, 1], vertical_alignment="center")
     if rows:
-        col_count.subheader(f"소재 카드 {len(rows)}장 ({rows[0]['source_name']})")
+        if scope == SCOPE_THIS:
+            # URL 크롤링은 소재마다 출처(게시물 주소)가 달라, 넣은 파일 이름·URL 을 보여 줌
+            where = st.session_state.get("source_name") or rows[0]["source_name"]
+        else:
+            where = SCOPE_ALL
+        count = f"{len(rows)}장 중 {len(shown)}장" if filtered else f"{len(rows)}장"
+        col_count.subheader(f"소재 카드 {count} ({where})")
     else:
         col_count.subheader("Supabase에 저장된 결과가 없습니다.")
-    col_down.download_button(
-        "다운로드", data=csv_data, file_name="분류결과.csv", mime="text/csv", type="primary", width="stretch"
+    col_all.download_button(
+        "전체 다운로드", data=to_csv(rows), file_name="분류결과.csv", mime="text/csv",
+        type="primary", width="stretch",
+    )
+    col_some.download_button(
+        "거른 것만 다운로드", data=to_csv(shown), file_name="분류결과_필터.csv", mime="text/csv",
+        width="stretch", disabled=not filtered, help=None if filtered else "필터를 하나 이상 고르면 누를 수 있습니다.",
     )
     if col_home.button("처음 화면으로", width="stretch"):
         go(1)
-    st.caption("Supabase classification_results 표에 저장된 내용입니다. 태그는 AI가 분류했고, 고치는 기능은 없습니다.")
+    top.caption("Supabase classification_results 표에 저장된 내용입니다. 태그는 AI가 분류했고, 고치는 기능은 없습니다.")
+
+    if rows and not shown:
+        st.info("고른 조건에 맞는 소재가 없습니다. 필터를 바꾸거나 [초기화]를 눌러 주세요.")
 
     # 카드는 3열 격자로, 높이를 고정한 상자 안에서만 스크롤되게 함
     with st.container(height=520, border=False):
         grid = st.columns(3)
-        for i, row in enumerate(rows):
+        for i, row in enumerate(shown):
             with grid[i % 3].container(border=True):
                 st.markdown(f"**{row['title'] or row['content'][:50]}**")
-                st.caption(row["content"][:200])
+                # URL 크롤링 소재는 AI 요약을, 파일 소재(요약 없음)는 내용 앞부분을 보여 줌
+                st.caption(row.get("summary") or row["content"][:200])
                 st.markdown(
-                    f"`생애주기 : {row['lifecycle']}` `분야 : {row['field']}` `정보유형 : {row['info_type']}`"
+                    f"`대상 : {row['lifecycle']}` `분야 : {row['field']}` `정보유형 : {row['info_type']}`"
                 )
+                # 고정 기준에 담기지 않은 내용은 키워드로 (예전 결과처럼 키워드가 없으면 안 보임)
+                words = split_names(row.get("keywords"))
+                if words:
+                    st.caption("키워드 " + " ".join(f"#{w}" for w in words))
 
 
 # ---------- 첫 화면(랜딩 페이지) — 서비스 소개 (근거: PRD.md 목표·넣을 기능 1~3) ----------
@@ -609,9 +586,9 @@ LANDING_BUTTON_TEXT = LANDING_ACCENT if _SAME else LANDING_BG
 LANDING_CARD_BG = "rgba({}, {}, {}, 0.10)".format(*(int(LANDING_TEXT[i:i + 2], 16) for i in (1, 3, 5)))
 LANDING_FEATURES = [
     ("📂", "자동으로 나누기",
-     "표·글 파일이나 게시물 URL을 넣으면, 있는 기준은 참고하고 없는 기준은 새로 만들어 카테고리로 나눕니다."),
+     "표·글 파일이나 게시물 URL을 넣으면, 정해 둔 고정 기준으로 나누고 기준에 담기지 않는 내용은 키워드로 붙입니다."),
     ("🏷️", "세 기준으로 한눈에 보기",
-     "나뉜 결과를 소재 카드마다 생애주기·분야·정보유형 태그 3개로 함께 보여 줍니다."),
+     "나뉜 결과를 소재 카드마다 대상·분야·정보유형 태그와 키워드로 함께 보여 줍니다."),
     ("⬇️", "바로 내려받기",
      "나뉜 결과를 콘텐츠를 만들 때 바로 쓸 수 있는 정리된 파일로 내려받습니다."),
 ]
@@ -690,7 +667,7 @@ def landing():
                 hero_background()
             st.markdown(f"<div class='landing-title'>{SERVICE_NAME}</div>", unsafe_allow_html=True)
             st.markdown(
-                "<div class='landing-intro'>표·글 파일이나 게시물 URL을 넣으면 생애주기·분야·정보유형 기준으로 자동 분류해, "
+                "<div class='landing-intro'>표·글 파일이나 게시물 URL을 넣으면 대상·분야·정보유형 고정 기준으로 자동 분류해, "
                 "콘텐츠 제작에 바로 쓸 수 있는 데이터로 만들어 줍니다.</div>",
                 unsafe_allow_html=True,
             )
@@ -969,7 +946,7 @@ else:
         page_header("쓰인 분류 기준 확인", screen_2_description())
         screen = screen_2
     else:
-        page_header("분류 결과", "소재 카드마다 생애주기·분야·정보유형 태그가 붙어 있습니다.")
+        page_header("분류 결과", "소재 카드마다 대상·분야·정보유형 태그와 키워드가 붙어 있습니다.")
         screen = screen_3
 
     # 화면마다 바뀌는 내용은 테두리 상자 안에 둠 (머리 부분은 상자 밖에서 세 화면 공통)
