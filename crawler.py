@@ -7,7 +7,6 @@
 
 읽는 방법: requests + 파이썬 기본 html.parser (사용자가 고름, 근거: .claude/rules/upload.md)
 """
-import json
 import time
 from html.parser import HTMLParser
 from urllib import robotparser
@@ -15,7 +14,7 @@ from urllib.parse import urldefrag, urljoin, urlparse
 
 import requests
 
-from classifier import GEMINI_MODEL, call_gemini
+from classifier import ask_json
 
 MAX_POSTS = 20          # 한 번에 읽는 게시물 수 상한 (PRD 비목표 "한꺼번에 전체 분류"와 부딪히지 않게)
 MAX_LINKS_TO_AI = 150   # 게시물 링크를 고르라고 AI 에게 보내는 링크 수 상한
@@ -139,6 +138,7 @@ PICK_SCHEMA = {
     "type": "object",
     "properties": {"post_numbers": {"type": "array", "items": {"type": "integer"}}},
     "required": ["post_numbers"],
+    "additionalProperties": False,
 }
 
 EXTRACT_SCHEMA = {
@@ -155,23 +155,18 @@ EXTRACT_SCHEMA = {
                     "summary": {"type": "string"},
                 },
                 "required": ["no", "title", "body", "summary"],
+                "additionalProperties": False,
             },
         }
     },
     "required": ["results"],
+    "additionalProperties": False,
 }
 
 
-def ask_json(api_key, message, schema):
-    return json.loads(call_gemini(api_key, {
-        "model": GEMINI_MODEL,
-        "input": message,
-        "response_format": {"type": "text", "mime_type": "application/json", "schema": schema},
-    }))
-
-
-def pick_post_links(api_key, links):
-    """게시판 목록 페이지의 링크 중 개별 게시물 링크만 AI 가 골라 [(주소, 글자), ...] 로 돌려줌"""
+def pick_post_links(keys, links):
+    """게시판 목록 페이지의 링크 중 개별 게시물 링크만 AI 가 골라 [(주소, 글자), ...] 로 돌려줌
+    keys: classifier.AIKeys (Claude 가 안 되면 Gemini 로 이어서 함)"""
     lines = [
         "아래는 웹 페이지에 있는 링크 목록이다. 이 중 게시물 하나(글 한 건)로 가는 링크만 골라 번호로 답하라.",
         "- 메뉴, 카테고리, 페이지 번호, 정렬, 로그인, 사이트 안내, 배너 링크는 빼라.",
@@ -179,7 +174,7 @@ def pick_post_links(api_key, links):
         "",
     ]
     lines += [f"{no}. {text} — {url}" for no, (url, text) in enumerate(links, start=1)]
-    answer = ask_json(api_key, "\n".join(lines), PICK_SCHEMA)
+    answer, _ = ask_json(keys, "\n".join(lines), PICK_SCHEMA)
     picked = []
     for no in answer.get("post_numbers", []):
         if 1 <= no <= len(links) and links[no - 1] not in picked:
@@ -187,7 +182,7 @@ def pick_post_links(api_key, links):
     return picked[:MAX_POSTS]
 
 
-def extract_posts(api_key, pages):
+def extract_posts(keys, pages):
     """pages: [(주소, <title>, 페이지 글자), ...] → [{"url", "title", "body", "summary"}, ...]"""
     posts = []
     for start in range(0, len(pages), EXTRACT_CHUNK):
@@ -204,7 +199,8 @@ def extract_posts(api_key, pages):
         ]
         for no, (url, title, text) in chunk:
             lines.append(f"[no {no}] 페이지 제목: {title}\n{text[:PAGE_TEXT_LIMIT]}\n")
-        answer = ask_json(api_key, "\n".join(lines), EXTRACT_SCHEMA)
+        # 본문을 그대로 옮기는 정리라 조금 더 꼼꼼하게(medium)
+        answer, _ = ask_json(keys, "\n".join(lines), EXTRACT_SCHEMA, effort="medium")
         by_no = {r["no"]: r for r in answer.get("results", [])}
         for no, (url, title, _) in chunk:
             r = by_no.get(no)
@@ -218,7 +214,7 @@ def extract_posts(api_key, pages):
     return posts
 
 
-def crawl(url, api_key, progress=None):
+def crawl(url, keys, progress=None):
     """URL 을 크롤링해 [{"url", "title", "body", "summary"}, ...] 를 돌려줌.
     progress(글) 를 주면 진행 상황을 알려 줌."""
     say = progress or (lambda _: None)
@@ -233,7 +229,7 @@ def crawl(url, api_key, progress=None):
     post_links = []
     if links:
         say(f"링크 {len(links)}개 중 게시물 링크를 AI가 고르는 중입니다...")
-        post_links = [(u, t) for u, t in pick_post_links(api_key, links) if crawler.allowed(u)]
+        post_links = [(u, t) for u, t in pick_post_links(keys, links) if crawler.allowed(u)]
 
     if post_links:
         pages = []
@@ -252,7 +248,7 @@ def crawl(url, api_key, progress=None):
     if not pages:
         raise CrawlError("페이지에서 읽어 온 내용이 없습니다. 다른 URL을 넣어 주세요.")
     say(f"AI가 게시물 {len(pages)}건의 제목·본문·요약을 정리하는 중입니다...")
-    posts = extract_posts(api_key, pages)
+    posts = extract_posts(keys, pages)
     if not posts:
         raise CrawlError("페이지에서 게시물 본문을 찾지 못했습니다. 다른 URL을 넣어 주세요.")
     return posts

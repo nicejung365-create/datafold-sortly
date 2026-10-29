@@ -3,7 +3,7 @@
 예전에는 AI 가 기준 이름을 그때그때 지어 Supabase classification_results 표에 저장했음.
 이 스크립트는 표의 모든 소재를 classifier.py 로 다시 분류해 고정 기준 이름과 키워드로 바꿈.
 
-실행 (먼저 data/new_columns.sql 을 Supabase SQL Editor 에서 한 번 실행해 keywords 칸을 만들어 둘 것)
+실행 (먼저 data/new_columns.sql 을 Supabase SQL Editor 에서 한 번 실행해 keywords·ai_model 칸을 만들어 둘 것)
   python remap_fixed.py           미리보기만: 바뀔 내용을 backup/remap_preview_*.csv 로 남기고 Supabase 는 그대로 둠
   python remap_fixed.py --apply   실제로 바꿈: 바꾸기 전 값을 backup/remap_before_*.csv 로 먼저 남긴 뒤 바꿈
 
@@ -16,7 +16,7 @@ from pathlib import Path
 
 import requests
 
-from classifier import TAG_AXES, classify_items
+from classifier import TAG_AXES, AIKeys, classify_items
 
 ROOT = Path(__file__).parent
 TABLE = "classification_results"
@@ -78,7 +78,9 @@ def main():
 
     items = [((r["title"] or "").strip(), r["content"] or "") for r in rows]
     print("AI 로 고정 기준 분류와 키워드를 받는 중입니다...")
-    tag_list = classify_items(env.get("GEMINI_API_KEY", ""), items)
+    # Claude 를 먼저 쓰고, 소진·한도·장애면 Gemini 로 이어서 함 — 소재마다 분류한 AI 를 ai_model 칸에 남김
+    keys = AIKeys(claude=env.get("ANTHROPIC_API_KEY", ""), gemini=env.get("GEMINI_API_KEY", ""))
+    tag_list = classify_items(keys, items)
 
     preview = []
     for r, tags in zip(rows, tag_list):

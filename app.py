@@ -14,8 +14,11 @@ import streamlit as st
 from PIL import Image
 
 # 고정 기준(대상·분야·정보유형)으로 분류하고 키워드를 붙이는 부분 — remap_fixed.py 와 함께 씀
+import anthropic
+
 from classifier import (
-    FIXED_CRITERIA, GEMINI_MODEL, TAG_AXES, call_gemini, classify_items, split_names,
+    CLAUDE_MODEL, FIXED_CRITERIA, GEMINI_MODEL, TAG_AXES, AIKeys, AIUnavailable,
+    chat, classify_items, estimated_cost, split_names, status_snapshot,
 )
 # 게시물 URL 을 크롤링해 AI 로 제목·본문·요약을 정리하는 부분
 from crawler import MAX_POSTS, CrawlError, crawl
@@ -48,15 +51,29 @@ HEADERS = {
     "apikey": env["SUPABASE_KEY"],
     "Authorization": f"Bearer {env['SUPABASE_KEY']}",
 }
-GEMINI_API_KEY = env.get("GEMINI_API_KEY", "")
+# Claude 를 먼저 쓰고, 소진·한도·장애면 Gemini 로 이어서 함 (classifier.py)
+AI_KEYS = AIKeys(claude=env.get("ANTHROPIC_API_KEY", ""), gemini=env.get("GEMINI_API_KEY", ""))
 
 
 def error_text(e):
     if e.response is not None and e.response.text:
         text = f"{e} — {e.response.text}"
-        if "keywords" in e.response.text or "summary" in e.response.text:
-            text += f"\n\n→ Supabase 표에 keywords·summary 칸이 없습니다. {NEW_COLUMNS_SQL} 을 SQL Editor 에서 한 번 실행해 주세요."
+        if any(col in e.response.text for col in ("keywords", "summary", "ai_model")):
+            text += f"\n\n→ Supabase 표에 keywords·summary·ai_model 칸이 없습니다. {NEW_COLUMNS_SQL} 을 SQL Editor 에서 한 번 실행해 주세요."
         return text
+    return str(e)
+
+
+def ai_error_text(e):
+    # Claude API 오류를 화면에 보여 줄 문구로 (종류별로 무엇을 하면 되는지 함께)
+    if isinstance(e, anthropic.AuthenticationError):
+        return ".env 의 ANTHROPIC_API_KEY 가 맞지 않습니다. 키를 확인해 주세요."
+    if isinstance(e, anthropic.RateLimitError):
+        return "Claude API 사용량 한도에 걸렸습니다. 잠시 뒤 다시 해 주세요."
+    if isinstance(e, anthropic.APIStatusError):
+        return f"Claude API 오류 ({e.status_code}): {e.message}"
+    if isinstance(e, anthropic.APIConnectionError):
+        return "Claude API 에 연결하지 못했습니다. 인터넷 연결을 확인해 주세요."
     return str(e)
 
 
@@ -65,7 +82,7 @@ def save_rows(rows):
     res.raise_for_status()
 
 
-ROW_FIELDS = "item_order,source_name,title,content,lifecycle,field,info_type,keywords,summary"
+ROW_FIELDS = "item_order,source_name,title,content,lifecycle,field,info_type,keywords,summary,ai_model"
 
 
 def fetch_rows(batch_id):
@@ -298,8 +315,8 @@ def screen_1():
             st.warning("업로드된 파일이 없습니다. 파일을 업로드 후 이용해주세요.")
             return
 
-        if not GEMINI_API_KEY:
-            st.error(".env 에 GEMINI_API_KEY 를 먼저 채워 주세요.")
+        if not AI_KEYS.claude:
+            st.error(".env 에 ANTHROPIC_API_KEY 를 먼저 채워 주세요.")
             return
 
         if uploaded_file is not None:
@@ -318,10 +335,18 @@ def screen_1():
             # 사이트를 크롤링하고 AI 가 게시물마다 제목·본문·요약을 정리함 (진행 상황을 한 줄씩 보여 줌)
             with st.status("사이트에서 게시물을 읽어 오는 중입니다...") as status:
                 try:
-                    posts = crawl(source_name, GEMINI_API_KEY, progress=lambda text: status.update(label=text))
+                    posts = crawl(source_name, AI_KEYS, progress=lambda text: status.update(label=text))
                 except CrawlError as e:
                     status.update(label="읽어 오지 못했습니다", state="error")
                     st.warning(str(e))
+                    return
+                except AIUnavailable as e:
+                    status.update(label="AI가 정리하지 못했습니다", state="error")
+                    st.error(str(e))
+                    return
+                except anthropic.APIError as e:
+                    status.update(label="AI가 정리하지 못했습니다", state="error")
+                    st.error(f"AI 정리를 받지 못했습니다: {ai_error_text(e)}")
                     return
                 except requests.RequestException as e:
                     status.update(label="읽어 오지 못했습니다", state="error")
@@ -346,9 +371,12 @@ def screen_1():
         # AI 는 고정 기준(대상·분야·정보유형) 안에서만 고르고, 부족한 내용은 키워드로 붙임
         with st.spinner(f"AI가 소재 {len(items)}건을 분류하는 중입니다..."):
             try:
-                tag_list = classify_items(GEMINI_API_KEY, items)
-            except requests.RequestException as e:
-                st.error(f"AI 분류를 받지 못했습니다: {error_text(e)}")
+                tag_list = classify_items(AI_KEYS, items)
+            except AIUnavailable as e:
+                st.error(str(e))
+                return
+            except anthropic.APIError as e:
+                st.error(f"AI 분류를 받지 못했습니다: {ai_error_text(e)}")
                 return
             except (ValueError, KeyError, TypeError) as e:
                 st.error(f"AI 답을 읽지 못했습니다: {e}")
@@ -366,6 +394,11 @@ def screen_1():
         st.session_state.source_name = source_name  # 화면 3 맨 위에 보여 줄, 넣은 파일 이름·URL
         st.session_state.criteria = used_criteria(items, tag_list)
         st.session_state.keywords = used_keywords(items, tag_list)
+        gemini_count = sum(1 for tags in tag_list if tags["ai_model"] == GEMINI_MODEL)
+        st.session_state.ai_notice = (
+            f"Claude 를 쓸 수 없어 소재 {gemini_count}건을 Gemini로 분류했습니다. ({status_snapshot()['reason']})"
+            if gemini_count else ""
+        )
         go(2)
 
 
@@ -384,6 +417,8 @@ def titles_text(titles):
 
 
 def screen_2():
+    if st.session_state.get("ai_notice"):
+        st.info(st.session_state.ai_notice)
     criteria = st.session_state.get("criteria", [])
     existing_rows = [c for c in criteria if c["status"] == "기존"]
     new_rows = [c for c in criteria if c["status"] == "신규"]
@@ -488,9 +523,10 @@ def clear_filters():
 def to_csv(rows):
     df = pd.DataFrame(
         rows,
-        columns=["item_order", "title", "summary", "content", "lifecycle", "field", "info_type", "keywords", "source_name"],
+        columns=["item_order", "title", "summary", "content", "lifecycle", "field", "info_type", "keywords",
+                 "ai_model", "source_name"],
     )
-    df.columns = ["순서", "제목", "요약", "내용", "대상", "분야", "정보유형", "키워드", "출처"]
+    df.columns = ["순서", "제목", "요약", "내용", "대상", "분야", "정보유형", "키워드", "분류 AI", "출처"]
     return df.to_csv(index=False).encode("utf-8-sig")
 
 
@@ -572,6 +608,46 @@ def screen_3():
                 words = split_names(row.get("keywords"))
                 if words:
                     st.caption("키워드 " + " ".join(f"#{w}" for w in words))
+                # 어느 AI 가 분류했는지 (예전 결과처럼 기록이 없으면 안 보임)
+                if row.get("ai_model"):
+                    st.caption(f"분류 AI · {row['ai_model']}")
+
+
+# ---------- 사이드바: Claude 상태 ----------
+# 크레딧 잔액을 알려 주는 API 는 없어, 응답에서 알 수 있는 것만 보여 줌 (근거: 공식 문서 Rate limits · Usage and Cost API)
+BILLING_URL = "https://platform.claude.com/settings/billing"
+LIMIT_LABELS = {"requests": "요청", "input-tokens": "입력 토큰", "output-tokens": "출력 토큰"}
+
+
+def claude_status_box():
+    s = status_snapshot()
+    with st.container(border=True):
+        st.markdown(f"**Claude 상태** · `{CLAUDE_MODEL}`")
+        if s["state"] == "unused":
+            st.caption("아직 이번 실행에서 Claude 를 부르지 않았습니다.")
+        elif s["state"] == "ok":
+            st.success("사용 가능", icon="✅")
+        else:
+            st.warning(f"{s['reason']} → Gemini로 이어서 쓰는 중", icon="⚠️")
+
+        if s["limits"]:
+            st.caption("분당 남은 한도 (마지막 응답 기준)")
+            for key, label in LIMIT_LABELS.items():
+                if key in s["limits"]:
+                    left, cap = s["limits"][key]
+                    st.progress(left / cap if cap else 0.0, text=f"{label} {left:,} / {cap:,}")
+
+        tokens = s["tokens"]
+        if s["claude_calls"]:
+            st.caption(
+                f"이번 실행에서 쓴 토큰: 입력 {tokens['input'] + tokens['cache_read']:,} · 출력 {tokens['output']:,}  \n"
+                f"추정 비용 약 ${estimated_cost(tokens):.4f} (계산한 값)"
+            )
+        if s["gemini_calls"]:
+            st.caption(f"Gemini 로 넘긴 요청: {s['gemini_calls']}번")
+        if s["updated"]:
+            st.caption(f"마지막 갱신 {s['updated'].strftime('%H:%M:%S')}")
+        st.caption(f"크레딧 잔액은 API 로 알 수 없어요 → [Claude Console Billing]({BILLING_URL})")
 
 
 # ---------- 첫 화면(랜딩 페이지) — 서비스 소개 (근거: PRD.md 목표·넣을 기능 1~3) ----------
@@ -793,8 +869,7 @@ def chat_log_list():
             st.divider()
 
 
-def ask_chatbot(api_key, history, tone):
-    # 공식 문서의 stateless 여러 차례 대화 방식: store=false + 지금까지의 대화를 input 배열로 보냄
+def ask_chatbot(keys, history, tone):
     # 고른 말투를 형식 고정 지시문 바로 뒤에 붙여, 시스템 지시문 끝과 마지막 질문 앞 두 곳에 함께 들어가게 함
     format_lock = (
         CHAT_FORMAT_LOCK_PATH.read_text(encoding="utf-8").strip() + "\n\n"
@@ -806,23 +881,11 @@ def ask_chatbot(api_key, history, tone):
         "[PRD.md]\n" + PRD_PATH.read_text(encoding="utf-8") + "\n\n"
         + format_lock
     )
-    # content 는 [{"type": "text", "text": ...}] 배열로 보내야 함 (model_output 에 글자만 보내면 400 오류)
-    steps = [
-        {
-            "type": "user_input" if m["role"] == "user" else "model_output",
-            "content": [{"type": "text", "text": m["text"]}],
-        }
-        for m in history
-    ]
+    # Claude Messages API 는 대화를 저장하지 않으므로, 지금까지의 대화를 매번 user/assistant 순서로 보냄
+    messages = [{"role": m["role"], "content": m["text"]} for m in history]
     # 마지막 질문 바로 앞에도 고정 지시문을 붙여 보냄 (화면의 대화 기록에는 붙이지 않음)
-    last = steps[-1]["content"][0]
-    last["text"] = format_lock + "\n\n[사용자 질문]\n" + last["text"]
-    return call_gemini(api_key, {
-        "model": GEMINI_MODEL,
-        "store": False,
-        "system_instruction": system,
-        "input": steps,
-    })
+    messages[-1]["content"] = format_lock + "\n\n[사용자 질문]\n" + messages[-1]["content"]
+    return chat(keys, system, messages)
 
 
 def chatbot():
@@ -890,6 +953,8 @@ def chatbot():
                     with st.chat_message("assistant", avatar=icon):
                         # 마크다운은 줄바꿈 하나를 띄어쓰기로 합치므로, 줄 끝에 공백 두 칸을 붙여 줄이 바뀌게 함
                         st.markdown(m["text"].replace("\n", "  \n"))
+                        if m.get("model") == GEMINI_MODEL:
+                            st.caption("Claude 를 쓸 수 없어 Gemini가 답했어요.")
                         copy_button(m["text"], dark)
                 else:
                     with st.chat_message("user"):
@@ -909,15 +974,21 @@ def chatbot():
             chat_log_list()
 
         if sent and question.strip():
-            if not GEMINI_API_KEY:
-                st.warning(".env 에 GEMINI_API_KEY 를 먼저 채워 주세요.")
+            if not AI_KEYS.claude:
+                st.warning(".env 에 ANTHROPIC_API_KEY 를 먼저 채워 주세요.")
                 return
             history = st.session_state.chat_history + [{"role": "user", "text": question.strip()}]
             with st.spinner("답을 쓰는 중이에요..."):
                 try:
-                    answer = ask_chatbot(GEMINI_API_KEY, history, tone)
-                except requests.RequestException as e:
-                    st.error(f"답을 받지 못했어요: {error_text(e)}")
+                    answer, model = ask_chatbot(AI_KEYS, history, tone)
+                except anthropic.APIError as e:
+                    st.error(f"답을 받지 못했어요: {ai_error_text(e)}")
+                    return
+                except AIUnavailable as e:
+                    st.error(str(e))
+                    return
+                except ValueError as e:  # 거절·답 끊김
+                    st.error(f"답을 받지 못했어요: {e}")
                     return
                 except OSError as e:
                     st.error(f"지시문 파일(chatbot_instruction.txt·chatbot_format_lock.txt)이나 PRD.md 를 읽지 못했어요: {e}")
@@ -927,7 +998,7 @@ def chatbot():
                 save_chat_log(question.strip(), tone, answer)
             except requests.RequestException as e:
                 st.session_state.chat_log_error = error_text(e)
-            st.session_state.chat_history = history + [{"role": "assistant", "text": answer}]
+            st.session_state.chat_history = history + [{"role": "assistant", "text": answer, "model": model}]
             st.rerun()
 
 
@@ -938,6 +1009,8 @@ else:
     # 기능 화면 사이드바에는 첫 화면으로 돌아가는 버튼 하나만 둠
     if st.sidebar.button("첫 화면으로", width="stretch"):
         go(0)
+    with st.sidebar:
+        claude_status_box()
 
     if st.session_state.page == 1:
         page_header("데이터 올리기", "표·글 파일을 넣으면 태그가 붙은 소재 카드가 만들어집니다.")
