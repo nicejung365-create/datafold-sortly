@@ -1,6 +1,7 @@
 """게시물 URL 을 크롤링해 AI 로 제목·본문·요약을 정리하는 부분.
 
 - 게시판 목록 주소를 넣으면: 같은 사이트 안의 링크 중 개별 게시물 링크를 AI 가 골라, 최대 MAX_POSTS 건까지 읽음
+  (한 쪽에서 모자라면 AI 가 고른 다음 페이지 링크를 따라가며, 최대 MAX_LIST_PAGES 쪽까지 읽음)
 - 글 하나의 주소를 넣으면: 그 글만 읽음
 - 읽은 페이지마다 AI 가 메뉴·바닥글 같은 잡음을 빼고 제목·본문을 뽑고, 본문을 한두 줄로 요약함
 - 사이트의 robots.txt(크롤링 허용 규칙)를 지키고, 요청 사이에 잠깐씩 쉼
@@ -16,8 +17,10 @@ import requests
 
 from classifier import ask_json
 
-MAX_POSTS = 20          # 한 번에 읽는 게시물 수 상한 (PRD 비목표 "한꺼번에 전체 분류"와 부딪히지 않게)
+MAX_POSTS = 100         # 한 번에 읽는 게시물 수 상한 (PRD 비목표 "한꺼번에 전체 분류"와 부딪히지 않게 상한은 둠)
+MAX_LIST_PAGES = 10     # 다음 페이지를 따라가며 읽는 게시판 목록 페이지 수 상한
 MAX_LINKS_TO_AI = 150   # 게시물 링크를 고르라고 AI 에게 보내는 링크 수 상한
+MAX_NAV_LINKS = 60      # 다음 페이지 링크를 고르라고 AI 에게 보내는 짧은 링크(페이지 번호 등) 수 상한
 PAGE_TEXT_LIMIT = 4000  # 페이지 하나에서 AI 에게 보내는 글자 수
 EXTRACT_CHUNK = 5       # 한 번에 AI 에게 정리를 맡기는 페이지 수
 REQUEST_GAP = 0.5       # 같은 사이트에 요청을 보낼 때 사이에 쉬는 초
@@ -39,7 +42,9 @@ class PageParser(HTMLParser):
         super().__init__()
         self.title = ""
         self.lines = [""]
-        self.links = []  # [(주소, 링크 글자), ...]
+        self.links = []  # [(주소, 링크 글자), ...] — 본문 영역 링크
+        self.all_links = []  # 메뉴·머리말·바닥글 안의 링크까지 (다음 페이지 링크를 찾을 때 씀)
+        self.link_in_skip = False
         self.skip_depth = 0
         self.in_title = False
         self.link_href = None
@@ -50,9 +55,10 @@ class PageParser(HTMLParser):
             self.skip_depth += 1
         elif tag == "title":
             self.in_title = True
-        elif tag == "a" and not self.skip_depth:
+        elif tag == "a":
             self.link_href = dict(attrs).get("href")
             self.link_text = ""
+            self.link_in_skip = bool(self.skip_depth)
         if tag in self.BLOCK:
             self.lines.append("")
 
@@ -62,7 +68,10 @@ class PageParser(HTMLParser):
         elif tag == "title":
             self.in_title = False
         elif tag == "a" and self.link_href is not None:
-            self.links.append((self.link_href, " ".join(self.link_text.split())))
+            link = (self.link_href, " ".join(self.link_text.split()))
+            self.all_links.append(link)
+            if not self.link_in_skip:
+                self.links.append(link)
             self.link_href = None
         if tag in self.BLOCK:
             self.lines.append("")
@@ -70,10 +79,11 @@ class PageParser(HTMLParser):
     def handle_data(self, data):
         if self.in_title:
             self.title += data
-        elif not self.skip_depth:
+            return
+        if self.link_href is not None:
+            self.link_text += data
+        if not self.skip_depth:
             self.lines[-1] += data
-            if self.link_href is not None:
-                self.link_text += data
 
     def text(self):
         lines = (" ".join(line.split()) for line in self.lines)
@@ -118,26 +128,39 @@ class Crawler:
         page.feed(res.text)
         return page
 
-    def candidate_links(self, page, base_url):
-        """같은 사이트 안의, 글자가 붙은 링크만 [(주소, 글자), ...] (나온 순서, 겹침 없이)"""
-        seen, links = {self.start_url}, []
-        for href, text in page.links:
-            if not href or len(text) < 4 or href.startswith(("#", "javascript:", "mailto:", "tel:")):
+    def _site_links(self, raw_links, base_url, skip):
+        """같은 사이트 안의 링크만 [(주소, 글자), ...] (나온 순서, 겹침 없이, skip 에 있는 주소는 뺌)"""
+        seen, links = set(skip), []
+        for href, text in raw_links:
+            if not href or not text or href.startswith(("#", "javascript:", "mailto:", "tel:")):
                 continue
             url = urldefrag(urljoin(base_url, href)).url
             if self._host(url) != self.site or url in seen or urlparse(url).path.lower().endswith(SKIP_EXT):
                 continue
             seen.add(url)
             links.append((url, text[:80]))
-        return links[:MAX_LINKS_TO_AI]
+        return links
+
+    def candidate_links(self, page, base_url, skip=()):
+        """게시물 후보 링크 — 본문 영역에서 글자가 4자 이상 붙은 링크만"""
+        links = self._site_links(page.links, base_url, {self.start_url, *skip})
+        return [(url, text) for url, text in links if len(text) >= 4][:MAX_LINKS_TO_AI]
+
+    def nav_links(self, page, base_url, skip=()):
+        """다음 페이지 후보 링크 — 메뉴 영역까지 포함해 글자가 짧은 링크(페이지 번호, 다음, > 등)만"""
+        links = self._site_links(page.all_links, base_url, {base_url, *skip})
+        return [(url, text) for url, text in links if len(text) <= 10][:MAX_NAV_LINKS]
 
 
 # ---------- AI 로 게시물 링크 고르기 · 제목·본문·요약 뽑기 ----------
 
 PICK_SCHEMA = {
     "type": "object",
-    "properties": {"post_numbers": {"type": "array", "items": {"type": "integer"}}},
-    "required": ["post_numbers"],
+    "properties": {
+        "post_numbers": {"type": "array", "items": {"type": "integer"}},
+        "next_page_number": {"type": "integer"},
+    },
+    "required": ["post_numbers", "next_page_number"],
     "additionalProperties": False,
 }
 
@@ -164,22 +187,31 @@ EXTRACT_SCHEMA = {
 }
 
 
-def pick_post_links(keys, links):
-    """게시판 목록 페이지의 링크 중 개별 게시물 링크만 AI 가 골라 [(주소, 글자), ...] 로 돌려줌
+def pick_post_links(keys, links, nav_links, limit):
+    """게시판 목록 페이지의 링크 중 개별 게시물 링크(최대 limit 개)와 다음 페이지 링크를 AI 가 골라
+    ([(주소, 글자), ...], 다음 페이지 주소 또는 None) 으로 돌려줌
     keys: classifier.AIKeys (Claude 가 안 되면 Gemini 로 이어서 함)"""
     lines = [
-        "아래는 웹 페이지에 있는 링크 목록이다. 이 중 게시물 하나(글 한 건)로 가는 링크만 골라 번호로 답하라.",
+        "아래는 웹 페이지에 있는 링크 목록이다.",
+        "1) [게시물 후보] 중 게시물 하나(글 한 건)로 가는 링크만 골라 post_numbers 에 번호로 답하라.",
         "- 메뉴, 카테고리, 페이지 번호, 정렬, 로그인, 사이트 안내, 배너 링크는 빼라.",
-        f"- 페이지에 나온 순서대로 최대 {MAX_POSTS}개까지 골라라. 게시물 링크가 없으면 빈 목록으로 답하라.",
+        f"- 페이지에 나온 순서대로 최대 {limit}개까지 골라라. 게시물 링크가 없으면 빈 목록으로 답하라.",
+        "2) [페이지 링크] 중 지금 게시판 목록의 바로 다음 쪽(다음 페이지)으로 가는 링크 하나를 골라 "
+        "next_page_number 에 번호로 답하라. 없거나 확실하지 않으면 0 으로 답하라.",
         "",
+        "[게시물 후보]",
     ]
     lines += [f"{no}. {text} — {url}" for no, (url, text) in enumerate(links, start=1)]
+    lines += ["", "[페이지 링크]"]
+    lines += [f"{no}. {text} — {url}" for no, (url, text) in enumerate(nav_links, start=1)]
     answer, _ = ask_json(keys, "\n".join(lines), PICK_SCHEMA)
     picked = []
     for no in answer.get("post_numbers", []):
         if 1 <= no <= len(links) and links[no - 1] not in picked:
             picked.append(links[no - 1])
-    return picked[:MAX_POSTS]
+    next_no = answer.get("next_page_number", 0)
+    next_url = nav_links[next_no - 1][0] if 1 <= next_no <= len(nav_links) else None
+    return picked[:limit], next_url
 
 
 def extract_posts(keys, pages):
@@ -224,12 +256,29 @@ def crawl(url, keys, progress=None):
 
     say("페이지를 읽는 중입니다...")
     start_page = crawler.fetch(url)
-    links = crawler.candidate_links(start_page, url)
 
-    post_links = []
-    if links:
-        say(f"링크 {len(links)}개 중 게시물 링크를 AI가 고르는 중입니다...")
-        post_links = [(u, t) for u, t in pick_post_links(keys, links) if crawler.allowed(u)]
+    # 게시판 목록을 한 쪽씩 읽으며 게시물 링크를 모음 — MAX_POSTS 건이 차거나, 다음 쪽이 없으면 멈춤
+    post_links, list_url, list_page, visited = [], url, start_page, [url]
+    for page_no in range(1, MAX_LIST_PAGES + 1):
+        links = crawler.candidate_links(list_page, list_url, skip=[u for u, _ in post_links] + visited)
+        if not links:
+            break
+        say(f"목록 {page_no}쪽의 링크 {len(links)}개 중 게시물 링크를 AI가 고르는 중입니다...")
+        picked, next_url = pick_post_links(
+            keys, links, crawler.nav_links(list_page, list_url, skip=visited), MAX_POSTS - len(post_links)
+        )
+        post_links += [(u, t) for u, t in picked if crawler.allowed(u)]
+        # 글 하나의 주소처럼 게시물이 안 골라진 쪽에서는 다음 쪽으로 넘어가지 않음
+        if not picked or len(post_links) >= MAX_POSTS or not next_url or next_url in visited \
+                or not crawler.allowed(next_url):
+            break
+        say(f"목록 {page_no + 1}쪽을 읽는 중입니다... (지금까지 게시물 {len(post_links)}건)")
+        try:
+            list_page = crawler.fetch(next_url)
+        except requests.RequestException:
+            break  # 다음 쪽을 읽지 못하면 지금까지 모은 게시물만 씀
+        list_url = next_url
+        visited.append(next_url)
 
     if post_links:
         pages = []

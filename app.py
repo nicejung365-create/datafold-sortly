@@ -311,7 +311,8 @@ def screen_1():
     with col_url:
         url = st.text_input("게시물 URL 입력", placeholder="URL을 입력하세요 (예: https://...)")
         st.caption(
-            f"게시판 목록 주소를 넣으면 게시물을 최대 {MAX_POSTS}건까지 읽어 와, AI가 제목·본문·요약을 정리한 뒤 분류합니다. "
+            f"게시판 목록 주소를 넣으면 다음 페이지까지 따라가며 게시물을 최대 {MAX_POSTS}건까지 읽어 와, "
+            "AI가 제목·본문·요약을 정리한 뒤 분류합니다. "
             "글 하나의 주소를 넣으면 그 글만 읽습니다."
         )
 
