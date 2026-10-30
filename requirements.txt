@@ -1,0 +1,5 @@
+anthropic
+pandas
+Pillow
+requests
+streamlit
