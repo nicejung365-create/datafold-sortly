@@ -1,17 +1,19 @@
 """게시물 URL 을 크롤링해 AI 로 제목·본문·요약을 정리하는 부분.
 
 - 게시판 목록 주소를 넣으면: 같은 사이트 안의 링크 중 개별 게시물 링크를 AI 가 골라, 최대 MAX_POSTS 건까지 읽음
-  (한 쪽에서 모자라면 AI 가 고른 다음 페이지 링크를 따라가며, 최대 MAX_LIST_PAGES 쪽까지 읽음)
+  (한 쪽에서 모자라면 AI 가 고른 다음 페이지 링크를 따라가며, 최대 MAX_LIST_PAGES 쪽까지 읽음.
+   다음 쪽 링크가 javascript 라 주소가 없으면, 주소의 쪽 번호(page·pageIndex 등)를 1 올려 읽음)
 - 글 하나의 주소를 넣으면: 그 글만 읽음
 - 읽은 페이지마다 AI 가 메뉴·바닥글 같은 잡음을 빼고 제목·본문을 뽑고, 본문을 한두 줄로 요약함
 - 사이트의 robots.txt(크롤링 허용 규칙)를 지키고, 요청 사이에 잠깐씩 쉼
 
 읽는 방법: requests + 파이썬 기본 html.parser (사용자가 고름, 근거: .claude/rules/upload.md)
 """
+import re
 import time
 from html.parser import HTMLParser
 from urllib import robotparser
-from urllib.parse import urldefrag, urljoin, urlparse
+from urllib.parse import parse_qsl, urldefrag, urlencode, urljoin, urlparse
 
 import requests
 
@@ -25,6 +27,8 @@ PAGE_TEXT_LIMIT = 4000  # 페이지 하나에서 AI 에게 보내는 글자 수
 EXTRACT_CHUNK = 5       # 한 번에 AI 에게 정리를 맡기는 페이지 수
 REQUEST_GAP = 0.5       # 같은 사이트에 요청을 보낼 때 사이에 쉬는 초
 USER_AGENT = "Mozilla/5.0 (compatible; DataSortlyBot/1.0)"
+# 게시판 주소에서 쪽 번호로 흔히 쓰는 이름 — 다음 쪽 링크가 javascript 라 주소가 없을 때, 이 숫자를 1 올려 다음 쪽을 읽음
+PAGE_PARAM = re.compile(r"^(page|pageindex|pageno|pagenum|page_no|pg|cpage|curpage|currentpage|nowpage)$", re.I)
 SKIP_EXT = (".pdf", ".hwp", ".hwpx", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".zip",
             ".jpg", ".jpeg", ".png", ".gif", ".mp4", ".mp3")
 
@@ -45,12 +49,17 @@ class PageParser(HTMLParser):
         self.links = []  # [(주소, 링크 글자), ...] — 본문 영역 링크
         self.all_links = []  # 메뉴·머리말·바닥글 안의 링크까지 (다음 페이지 링크를 찾을 때 씀)
         self.link_in_skip = False
+        self.inputs = []  # [(이름, 값), ...] — 숨은 입력칸에 쪽 번호 이름(pageIndex 등)이 있는지 볼 때 씀
         self.skip_depth = 0
         self.in_title = False
         self.link_href = None
         self.link_text = ""
 
     def handle_starttag(self, tag, attrs):
+        if tag == "input":
+            a = dict(attrs)
+            if a.get("name"):
+                self.inputs.append((a["name"], a.get("value") or ""))
         if tag in self.SKIP:
             self.skip_depth += 1
         elif tag == "title":
@@ -146,6 +155,23 @@ class Crawler:
         links = self._site_links(page.links, base_url, {self.start_url, *skip})
         return [(url, text) for url, text in links if len(text) >= 4][:MAX_LINKS_TO_AI]
 
+    @staticmethod
+    def numbered_next_url(page, list_url):
+        """다음 쪽 링크가 javascript 라 주소가 없을 때 쓰는 대신 방법 —
+        주소에 쪽 번호(page·pageIndex 등)가 있으면 1 올리고, 없으면 페이지 숨은 입력칸의 쪽 번호 이름으로 2쪽을 붙임"""
+        parts = urlparse(list_url)
+        query = parse_qsl(parts.query, keep_blank_values=True)
+        for i, (name, value) in enumerate(query):
+            if PAGE_PARAM.match(name):
+                if not value.isdigit():
+                    return None
+                query[i] = (name, str(int(value) + 1))
+                return parts._replace(query=urlencode(query)).geturl()
+        name = next((n for n, _ in page.inputs if PAGE_PARAM.match(n)), None)
+        if not name:
+            return None
+        return parts._replace(query=urlencode(query + [(name, "2")])).geturl()
+
     def nav_links(self, page, base_url, skip=()):
         """다음 페이지 후보 링크 — 메뉴 영역까지 포함해 글자가 짧은 링크(페이지 번호, 다음, > 등)만"""
         links = self._site_links(page.all_links, base_url, {base_url, *skip})
@@ -239,7 +265,7 @@ def extract_posts(keys, pages):
             if r and (r.get("body") or "").strip():
                 posts.append({
                     "url": url,
-                    "title": (r.get("title") or title).strip()[:100],
+                    "title": (r.get("title") or title).strip(),
                     "body": r["body"].strip(),
                     "summary": (r.get("summary") or "").strip(),
                 })
@@ -247,7 +273,7 @@ def extract_posts(keys, pages):
 
 
 def crawl(url, keys, progress=None):
-    """URL 을 크롤링해 [{"url", "title", "body", "summary"}, ...] 를 돌려줌.
+    """URL 을 크롤링해 ([{"url", "title", "body", "summary"}, ...], 넣은 페이지의 <title>) 을 돌려줌.
     progress(글) 를 주면 진행 상황을 알려 줌."""
     say = progress or (lambda _: None)
     crawler = Crawler(url)
@@ -268,6 +294,8 @@ def crawl(url, keys, progress=None):
             keys, links, crawler.nav_links(list_page, list_url, skip=visited), MAX_POSTS - len(post_links)
         )
         post_links += [(u, t) for u, t in picked if crawler.allowed(u)]
+        # AI 가 고를 다음 쪽 링크가 없으면(javascript 쪽 번호 등) 주소의 쪽 번호를 1 올려 봄
+        next_url = next_url or crawler.numbered_next_url(list_page, list_url)
         # 글 하나의 주소처럼 게시물이 안 골라진 쪽에서는 다음 쪽으로 넘어가지 않음
         if not picked or len(post_links) >= MAX_POSTS or not next_url or next_url in visited \
                 or not crawler.allowed(next_url):
@@ -300,4 +328,4 @@ def crawl(url, keys, progress=None):
     posts = extract_posts(keys, pages)
     if not posts:
         raise CrawlError("페이지에서 게시물 본문을 찾지 못했습니다. 다른 URL을 넣어 주세요.")
-    return posts
+    return posts, " ".join(start_page.title.split())

@@ -1,0 +1,8 @@
+# 웹(넓은 화면) 색 — app.py WEB_COLORS 와 같음. 모바일(폭 640px 이하)의 어두운 색은 app.py 가 CSS 로 덮어씀
+[theme]
+base = "light"
+primaryColor = "#1a5fd0"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f5f8fc"
+textColor = "#181f2d"
+baseFontSize = 17  # 기본 글자 크기(px)

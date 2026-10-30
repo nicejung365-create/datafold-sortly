@@ -88,7 +88,7 @@ def save_rows(rows):
     res.raise_for_status()
 
 
-ROW_FIELDS = "item_order,source_name,title,content,lifecycle,field,info_type,keywords,summary,ai_model"
+ROW_FIELDS = "item_order,source_type,source_name,title,content,lifecycle,field,info_type,keywords,summary,ai_model"
 
 
 def fetch_rows(batch_id):
@@ -278,21 +278,154 @@ STEPS = ["① 데이터 올리기", "② 기준 확인", "③ 분류 결과"]
 
 
 # 화면 위계 (세 화면 모두 같음)
-# 0 서비스 이름(작은 회색) → 1 화면 제목(st.title) → 2 브레드크럼(작은 글씨) → 3 화면 설명(본문)
-# → 4 구역 제목(st.subheader) → 5 구역 안 소제목(####) → 6 표 머리줄·도움말(st.caption)
+# 0 서비스 이름(0.82rem, 파랑) → 1 화면 제목(2rem, 가장 굵게) → 2 단계 알약 → 3 화면 설명(1rem)
+# → 4 구역 제목(st.subheader, 1.4rem + 왼쪽 막대) → 5 구역 안 소제목(####, 1.15rem) → 6 본문(1rem=17px)
+# → 7 표 머리줄·도움말(st.caption, 0.88rem, 흐린 색)
 # 버튼은 다음 단계로 가는 버튼 하나만 type="primary" 로 강조
 SERVICE_NAME = "AI 기반 데이터 자동분류·가공 플랫폼"
 
 
+# 색 — 상담 챗봇 아이콘(bot.png)에서 뽑은 색을 바탕으로, 화면 폭에 따라 두 벌을 씀
+# 웹(넓은 화면)은 흰 배경 · 진한 남색 글자 · 진한 파랑 강조 (아이콘 파랑 #4899fe 는 흰 바탕 대비 2.9 라 #1a5fd0(5.8)으로 진하게)
+# 모바일(폭 640px 이하)은 아이콘 그대로 어두운 배경 · 밝은 글자 · 파랑 강조
+# 머리 띠·첫 화면 히어로는 두 경우 모두 남색 띠(신뢰감을 주는 고정 영역)
+# 표·입력칸의 웹 색은 .streamlit/config.toml 테마, 모바일 색은 아래 MOBILE_WIDGETS 가 덮어씀
+WEB_COLORS = {
+    "bg": "#ffffff", "surface": "#ffffff", "field": "#f5f8fc",
+    "text": "#181f2d",    # 본문 글자 (흰 바탕 대비 16.5)
+    "muted": "#5b6576",   # 도움말·캡션 (대비 5.9)
+    "line": "#e2e8f0", "shadow": "0 1px 3px rgba(24, 31, 45, 0.08)",
+    "accent": "#1a5fd0", "on-accent": "#ffffff", "soft": "#eef4fe",
+}
+MOBILE_COLORS = {
+    "bg": "#0b0c10", "surface": "#181f2d", "field": "#252f45",
+    "text": "#eaf4fe",    # 로봇 얼굴 화면 색 (배경 대비 17.6)
+    "muted": "#a9b4c6",
+    "line": "rgba(234, 244, 254, 0.14)", "shadow": "0 4px 16px rgba(0, 0, 0, 0.35)",
+    "accent": "#4899fe", "on-accent": "#0b0c10", "soft": "rgba(72, 153, 254, 0.18)",
+}
+# 남색 띠(머리 띠·히어로) — 웹·모바일 공통
+BAND_COLORS = {
+    "band": "#181f2d", "band-text": "#ffffff", "band-muted": "#a9b4c6",  # 띠 위 설명 글자 (대비 7.9)
+    "band-accent": "#4899fe", "band-on-accent": "#0b0c10", "band-glow": "rgba(72, 153, 254, 0.30)",
+}
+MOBILE_WIDTH = 640  # Streamlit 이 모바일 배치로 바뀌는 폭과 같음
+
+
+def css_vars(colors):
+    return " ".join(f"--{name}: {value};" for name, value in colors.items())
+
+
+# 모바일에서 Streamlit 기본 부품(글자·입력칸·버튼·사이드바)을 어두운 색으로 덮어씀
+MOBILE_WIDGETS = """
+.stApp, [data-testid="stHeader"], [data-testid="stSidebar"], [data-testid="stSidebarContent"] {
+    background: var(--bg); color: var(--text);
+}
+.stApp [data-testid="stMarkdownContainer"] :is(p, li, strong, h1, h2, h3, h4),
+.stApp [data-testid="stHeading"] :is(h1, h2, h3, h4, span),
+.stApp [data-testid="stWidgetLabel"] p { color: var(--text); }
+.stApp [data-testid="stCaptionContainer"], .stApp [data-testid="stCaptionContainer"] p { color: var(--muted); }
+.stApp :is([data-baseweb="input"], [data-baseweb="base-input"], [data-baseweb="textarea"],
+           [data-baseweb="select"] > div, [data-testid="stFileUploaderDropzone"]) {
+    background: var(--field); border-color: var(--line); color: var(--text);
+}
+.stApp :is(input, textarea) { color: var(--text); -webkit-text-fill-color: var(--text); }
+/* 보조 버튼은 사이드바·화면 내용 상자 안의 것만 (첫 화면 [시작하기]·챗봇 아이콘은 각자 모양을 지킴) */
+:is([data-testid="stSidebar"], .st-key-inner_body) button[kind="secondary"] {
+    background: var(--surface); border-color: var(--line); color: var(--text);
+}
+:is([data-testid="stSidebar"], .st-key-inner_body) button[kind="secondary"] p { color: var(--text); }
+[data-testid="stHeader"] :is(button, svg) { color: var(--text); fill: var(--text); }
+"""
+
+
+def base_style():
+    # 모든 화면 공통: 색 변수 · 글자 위계 (기본 글자 17px 은 .streamlit/config.toml 의 baseFontSize)
+    st.markdown(f"""
+<style>
+:root {{ {css_vars(WEB_COLORS)} {css_vars(BAND_COLORS)} }}
+@media (max-width: {MOBILE_WIDTH}px) {{
+    :root {{ {css_vars(MOBILE_COLORS)} }}
+    {MOBILE_WIDGETS}
+}}
+.stApp {{ background: var(--bg); }}
+[data-testid="stSidebar"] {{ background: var(--field); border-right: 1px solid var(--line); }}
+/* 글자 위계 — 본문 1rem(17px) 기준, 단계마다 약 1.25배 */
+.stApp [data-testid="stMarkdownContainer"] :is(p, li) {{ line-height: 1.7; }}
+.stApp [data-testid="stCaptionContainer"] {{ font-size: 0.88rem; line-height: 1.6; color: var(--muted); }}
+.stApp [data-testid="stHeading"] h3 {{ font-size: 1.4rem; font-weight: 700; color: var(--text); }}
+.stApp [data-testid="stMarkdownContainer"] h4 {{ font-size: 1.15rem; font-weight: 700; color: var(--text); }}
+</style>
+""", unsafe_allow_html=True)
+
+
+def inner_style():
+    # 기능 화면(1~3): 남색 머리 띠 + 흰 카드 (모바일은 어두운 카드)
+    st.markdown(f"""
+<style>
+/* 머리 띠: 남색 바탕 위에 서비스 이름(작은 글씨) → 화면 제목(가장 큼) → 단계 알약 → 설명 */
+.stApp .st-key-inner_head {{
+    border-radius: 16px; padding: 28px 32px; margin-bottom: 8px;
+    background: radial-gradient(circle at 88% 15%, var(--band-glow), transparent 50%), var(--band);
+}}
+.stApp .st-key-inner_head .inner-service {{
+    color: var(--band-accent); font-size: 0.82rem; font-weight: 700; letter-spacing: 0.04em;
+}}
+.stApp .st-key-inner_head .inner-title {{
+    color: var(--band-text); font-size: 2rem; font-weight: 800; line-height: 1.3; margin: 4px 0 14px;
+}}
+.inner-steps {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }}
+.stApp .st-key-inner_head .inner-step {{
+    padding: 4px 14px; border-radius: 999px; font-size: 0.88rem;
+    border: 1px solid rgba(255, 255, 255, 0.25); color: var(--band-muted);
+}}
+.stApp .st-key-inner_head .inner-step.now {{
+    background: var(--band-accent); border-color: var(--band-accent); color: var(--band-on-accent); font-weight: 700;
+}}
+.stApp .st-key-inner_head .inner-desc {{ color: var(--band-muted); font-size: 1rem; line-height: 1.6; margin: 0; }}
+/* 화면 내용 상자 · 결과 카드: 흰 바탕 · 연한 테두리 · 옅은 그림자 */
+.st-key-inner_body, [class*="st-key-result_card"] {{
+    background: var(--surface); border: 1px solid var(--line) !important; border-radius: 12px;
+    box-shadow: var(--shadow);
+}}
+.st-key-inner_body {{ padding: 28px; }}
+[class*="st-key-result_card"] {{ padding: 18px; }}
+[class*="st-key-result_card"]:hover {{ border-color: var(--accent) !important; }}
+/* 구역 제목은 왼쪽 파랑 막대로 구분 (강조색은 버튼·링크·막대에만 써서 눈이 덜 피로하게) */
+.stApp .st-key-inner_body [data-testid="stHeading"] h3 {{ border-left: 4px solid var(--accent); padding-left: 12px; }}
+/* 카드: 제목(굵게) → 요약(캡션) → 태그 알약 → 키워드·링크 */
+.stApp [class*="st-key-result_card"] [data-testid="stMarkdownContainer"] p strong {{ font-size: 1.05rem; color: var(--text); }}
+[class*="st-key-result_card"] code {{
+    background: var(--soft); color: var(--accent); border-radius: 999px; padding: 2px 10px;
+    font-family: inherit; font-size: 0.82rem; font-weight: 600;
+}}
+.stApp [class*="st-key-result_card"] a {{ color: var(--accent); font-weight: 700; text-decoration: none; }}
+/* 다음 단계로 가는 강조 버튼: 꽉 찬 파랑, 마우스를 올리면 테두리만 */
+.st-key-inner_body button[kind="primary"] {{ background: var(--accent); border: 2px solid var(--accent); }}
+.stApp .st-key-inner_body button[kind="primary"] p {{ color: var(--on-accent); font-weight: 700; }}
+.st-key-inner_body button[kind="primary"]:hover {{ background: transparent; border-color: var(--accent); }}
+.stApp .st-key-inner_body button[kind="primary"]:hover p {{ color: var(--accent); }}
+@media (max-width: {MOBILE_WIDTH}px) {{
+    .stApp .st-key-inner_head {{ padding: 22px 20px; }}
+    .stApp .st-key-inner_head .inner-title {{ font-size: 1.6rem; }}
+    .st-key-inner_body {{ padding: 18px; }}
+}}
+</style>
+""", unsafe_allow_html=True)
+
+
 def page_header(title, description):
-    st.caption(SERVICE_NAME)
-    st.title(title)
-    # 타이틀 바로 밑에 지금 어느 화면인지 보여 줌 (지금 화면만 굵게)
-    st.caption(" › ".join(
-        f"**{name}**" if i == st.session_state.page else name for i, name in enumerate(STEPS, start=1)
-    ))
-    st.write(description)
-    st.divider()
+    # 지금 어느 화면인지 단계 알약으로 보여 줌 (지금 화면만 파랑으로 채움)
+    steps = "".join(
+        f"<span class='inner-step{' now' if i == st.session_state.page else ''}'>{name}</span>"
+        for i, name in enumerate(STEPS, start=1)
+    )
+    with st.container(key="inner_head"):
+        st.markdown(
+            f"<div class='inner-service'>{SERVICE_NAME}</div><div class='inner-title'>{title}</div>"
+            f"<div class='inner-steps'>{steps}</div><p class='inner-desc'>{description}</p>",
+            unsafe_allow_html=True,
+        )
 
 
 def screen_1():
@@ -342,7 +475,7 @@ def screen_1():
             # 사이트를 크롤링하고 AI 가 게시물마다 제목·본문·요약을 정리함 (진행 상황을 한 줄씩 보여 줌)
             with st.status("사이트에서 게시물을 읽어 오는 중입니다...") as status:
                 try:
-                    posts = crawl(source_name, AI_KEYS, progress=lambda text: status.update(label=text))
+                    posts, page_title = crawl(source_name, AI_KEYS, progress=lambda text: status.update(label=text))
                 except CrawlError as e:
                     status.update(label="읽어 오지 못했습니다", state="error")
                     st.warning(str(e))
@@ -367,6 +500,7 @@ def screen_1():
             items = [(p["title"], p["body"]) for p in posts]
             sources = [p["url"] for p in posts]
             summaries = [p["summary"] for p in posts]
+            source_label = page_title or source_name  # 화면 3 맨 위에는 URL 대신 넣은 페이지의 제목을 보여 줌
 
         if not items:
             if source_type == "url":
@@ -398,7 +532,8 @@ def screen_1():
             return
 
         st.session_state.batch_id = batch_id
-        st.session_state.source_name = source_name  # 화면 3 맨 위에 보여 줄, 넣은 파일 이름·URL
+        # 화면 3 맨 위에 보여 줄, 넣은 파일 이름 · URL 페이지의 제목
+        st.session_state.source_name = source_label if source_type == "url" else source_name
         st.session_state.criteria = used_criteria(items, tag_list)
         st.session_state.keywords = used_keywords(items, tag_list)
         gemini_count = sum(1 for tags in tag_list if tags["ai_model"] == GEMINI_MODEL)
@@ -577,7 +712,7 @@ def screen_3():
     col_count, col_all, col_some, col_home = top.columns([3.4, 1, 1, 1], vertical_alignment="center")
     if rows:
         if scope == SCOPE_THIS:
-            # URL 크롤링은 소재마다 출처(게시물 주소)가 달라, 넣은 파일 이름·URL 을 보여 줌
+            # URL 크롤링은 소재마다 출처(게시물 주소)가 달라, 넣은 파일 이름·URL 페이지의 제목을 보여 줌
             where = st.session_state.get("source_name") or rows[0]["source_name"]
         else:
             where = SCOPE_ALL
@@ -604,7 +739,7 @@ def screen_3():
     with st.container(height=520, border=False):
         grid = st.columns(3)
         for i, row in enumerate(shown):
-            with grid[i % 3].container(border=True):
+            with grid[i % 3].container(key=f"result_card_{i}"):
                 st.markdown(f"**{row['title'] or row['content'][:50]}**")
                 # URL 크롤링 소재는 AI 요약을, 파일 소재(요약 없음)는 내용 앞부분을 보여 줌
                 st.caption(row.get("summary") or row["content"][:200])
@@ -615,6 +750,9 @@ def screen_3():
                 words = split_names(row.get("keywords"))
                 if words:
                     st.caption("키워드 " + " ".join(f"#{w}" for w in words))
+                # URL 로 읽은 소재는 원래 게시물로 가는 링크 (새 탭에서 열림)
+                if row.get("source_type") == "url" and row.get("source_name"):
+                    st.markdown(f"[게시물 보기 ↗]({row['source_name']})")
                 # 어느 AI 가 분류했는지 (예전 결과처럼 기록이 없으면 안 보임)
                 if row.get("ai_model"):
                     st.caption(f"분류 AI · {row['ai_model']}")
@@ -659,14 +797,6 @@ def claude_status_box():
 
 # ---------- 첫 화면(랜딩 페이지) — 서비스 소개 (근거: PRD.md 목표·넣을 기능 1~3) ----------
 
-LANDING_BG, LANDING_ACCENT, LANDING_TEXT = "#242627", "#3fb645", "#ebeceb"
-# 강조색이 배경색과 같으면 강조색 자리(제목·카드 테두리·버튼 바탕)가 배경에 묻히므로 글자색으로 대신 보이게 하고,
-# 버튼 글자는 강조색으로 씀
-_SAME = LANDING_ACCENT.lower() == LANDING_BG.lower()
-LANDING_MARK = LANDING_TEXT if _SAME else LANDING_ACCENT  # 제목·카드 제목·카드 테두리·버튼 바탕
-LANDING_BUTTON_TEXT = LANDING_ACCENT if _SAME else LANDING_BG
-# 카드 바탕은 글자색을 아주 옅게 깔아, 배경 위에서 카드 구역이 구분되게 함
-LANDING_CARD_BG = "rgba({}, {}, {}, 0.10)".format(*(int(LANDING_TEXT[i:i + 2], 16) for i in (1, 3, 5)))
 LANDING_FEATURES = [
     ("📂", "자동으로 나누기",
      "표·글 파일이나 게시물 URL을 넣으면, 정해 둔 고정 기준으로 나누고 기준에 담기지 않는 내용은 키워드로 붙입니다."),
@@ -675,7 +805,7 @@ LANDING_FEATURES = [
     ("⬇️", "바로 내려받기",
      "나뉜 결과를 콘텐츠를 만들 때 바로 쓸 수 있는 정리된 파일로 내려받습니다."),
 ]
-# 히어로 영역 배경 영상 — make_hero.py 로 만듦. 파일이 없으면 같은 자리에 초록 빛 번짐 그림을 대신 깜
+# 히어로 영역 배경 영상 — make_hero.py 로 만듦. 파일이 없으면 같은 자리에 파랑 빛 번짐 그림을 대신 깜
 HERO_VIDEO_PATH = Path(__file__).parent / "hero.mp4"
 
 
@@ -686,22 +816,18 @@ def hero_background():
         st.video(str(HERO_VIDEO_PATH), autoplay=True, muted=True, loop=True)
     else:
         st.markdown("<div class='landing-hero-media landing-hero-fallback'></div>", unsafe_allow_html=True)
-    # 영상 위에 배경색을 반쯤 덮어, 위에 올린 제목·버튼 글자가 잘 읽히게 함
+    # 영상 위에 남색을 덮어, 위에 올린 제목·버튼 글자가 잘 읽히게 함
     st.markdown("<div class='landing-hero-shade'></div>", unsafe_allow_html=True)
 
 
 def landing():
-    # 색은 이 첫 화면에만 씀 — 기능 화면(1~3)에는 이 스타일이 들어가지 않음
+    # 첫 화면 전용 스타일 — 남색 히어로 + 흰 기능 카드 (모바일은 어두운 카드, 색 변수는 base_style)
     st.markdown(f"""
 <style>
-.stApp {{ background: {LANDING_BG}; }}
-[data-testid="stHeader"] {{ background: transparent; color: {LANDING_TEXT}; }}
-[data-testid="stHeader"] button, [data-testid="stHeader"] svg {{ color: {LANDING_TEXT}; fill: {LANDING_TEXT}; }}
-.st-key-landing p, .st-key-landing li {{ color: {LANDING_TEXT}; }}
 /* 히어로 영역: 배경 영상을 깔고 그 위에 제목·소개·버튼을 가운데로 올림 */
 .st-key-landing_hero {{
     position: relative; overflow: hidden; border-radius: 20px; min-height: 440px;
-    justify-content: center; padding: 48px 24px; margin-bottom: 32px;
+    justify-content: center; padding: 48px 24px; margin-bottom: 32px; background: var(--band);
 }}
 /* 배경 상자(와 그것을 감싼 틀)는 히어로 영역 전체를 채우고 맨 뒤에, 나머지(제목·소개·버튼)는 그 위에 */
 .st-key-landing_hero > div:has(.st-key-landing_hero_bg) {{ position: absolute; inset: 0; z-index: 0; }}
@@ -715,31 +841,43 @@ def landing():
 .st-key-landing_hero_bg video {{ pointer-events: none; }}
 .st-key-landing_hero_bg video::-webkit-media-controls {{ display: none !important; }}
 .landing-hero-fallback {{
-    background:
-        radial-gradient(circle at 30% 40%, rgba(63, 182, 69, 0.28), transparent 45%),
-        radial-gradient(circle at 72% 60%, rgba(63, 182, 69, 0.22), transparent 50%),
-        {LANDING_BG};
+    background: radial-gradient(circle at 30% 40%, var(--band-glow), transparent 45%), var(--band);
 }}
-.landing-hero-shade {{ position: absolute; inset: 0; background: rgba(36, 38, 39, 0.45); }}
-.landing-title {{
-    color: {LANDING_MARK}; font-size: 2.8rem; font-weight: 800; line-height: 1.25;
-    text-align: center; margin: 0 0 12px;
+/* 영상 위를 남색으로 덮어, 흰 제목·소개·버튼이 잘 읽히게 함 */
+.landing-hero-shade {{ position: absolute; inset: 0; background: rgba(24, 31, 45, 0.82); }}
+/* 제목과 설명이 함께 눈에 들어오게 — 제목은 조금 줄이고, 설명은 흰 글자·굵게·크게, 핵심 말은 파랑으로 */
+.stApp .st-key-landing_hero .landing-title {{
+    color: var(--band-text); font-size: 2.1rem; font-weight: 800; line-height: 1.3;
+    text-align: center; margin: 0 0 18px;
 }}
-.landing-intro {{ color: {LANDING_TEXT}; font-size: 1.3rem; text-align: center; margin-bottom: 8px; }}
+.stApp .st-key-landing_hero .landing-intro {{
+    color: var(--band-text); font-size: 1.45rem; font-weight: 600; line-height: 1.6; text-align: center;
+    max-width: 820px; margin: 0 auto 8px; word-break: keep-all;
+}}
+.stApp .st-key-landing_hero .landing-intro b {{ color: var(--band-accent); font-weight: 800; }}
+/* 기능 카드: 흰 바탕 · 연한 테두리 · 옅은 그림자, 제목은 본문색 굵게 */
 [class*="st-key-landing_card"] {{
-    background: {LANDING_CARD_BG}; border: 1px solid {LANDING_MARK}; border-radius: 14px;
-    padding: 24px; height: 100%;
+    background: var(--surface); border: 1px solid var(--line); border-radius: 12px;
+    padding: 24px; height: 100%; box-shadow: var(--shadow);
 }}
 .landing-card-icon {{ font-size: 2rem; }}
-.landing-card-title {{ color: {LANDING_MARK}; font-size: 1.25rem; font-weight: 800; margin: 8px 0; }}
-/* 버튼: 꽉 찬 바탕 + 대비되는 글자, 마우스를 올리면 테두리만 남는 모양으로 바뀜 */
-.st-key-landing_start button {{
-    background: {LANDING_MARK}; border: 2px solid {LANDING_MARK};
-    font-size: 1.1rem; padding: 12px 0; margin-top: 32px;
+.stApp [class*="st-key-landing_card"] .landing-card-title {{
+    color: var(--text); font-size: 1.2rem; font-weight: 800; margin: 8px 0;
 }}
-.st-key-landing_start button:hover {{ background: transparent; border-color: {LANDING_TEXT}; }}
-.st-key-landing .st-key-landing_start button p {{ color: {LANDING_BUTTON_TEXT}; font-size: 1.1rem; font-weight: 700; }}
-.st-key-landing .st-key-landing_start button:hover p {{ color: {LANDING_TEXT}; }}
+.stApp [class*="st-key-landing_card"] [data-testid="stMarkdownContainer"] p {{ color: var(--muted); }}
+/* 버튼: 꽉 찬 파랑 + 어두운 글자, 마우스를 올리면 파랑 테두리만 남는 모양으로 바뀜 */
+.st-key-landing_start button {{
+    background: var(--band-accent); border: 2px solid var(--band-accent);
+    padding: 12px 0; margin-top: 32px;
+}}
+.st-key-landing_start button:hover {{ background: transparent; border-color: var(--band-accent); }}
+.stApp .st-key-landing .st-key-landing_start button p {{ color: var(--band-on-accent); font-size: 1.1rem; font-weight: 700; }}
+.stApp .st-key-landing .st-key-landing_start button:hover p {{ color: var(--band-accent); }}
+@media (max-width: {MOBILE_WIDTH}px) {{
+    .st-key-landing_hero {{ min-height: 360px; padding: 36px 18px; }}
+    .stApp .st-key-landing_hero .landing-title {{ font-size: 1.6rem; }}
+    .stApp .st-key-landing_hero .landing-intro {{ font-size: 1.15rem; }}
+}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -750,8 +888,8 @@ def landing():
                 hero_background()
             st.markdown(f"<div class='landing-title'>{SERVICE_NAME}</div>", unsafe_allow_html=True)
             st.markdown(
-                "<div class='landing-intro'>표·글 파일이나 게시물 URL을 넣으면 대상·분야·정보유형 고정 기준으로 자동 분류해, "
-                "콘텐츠 제작에 바로 쓸 수 있는 데이터로 만들어 줍니다.</div>",
+                "<div class='landing-intro'>표·글 파일이나 게시물 URL을 넣으면 <b>대상·분야·정보유형</b> 고정 기준으로 "
+                "자동 분류해, <b>콘텐츠 제작에 바로 쓸 수 있는 데이터</b>로 만들어 줍니다.</div>",
                 unsafe_allow_html=True,
             )
             if st.columns([2, 1, 2])[1].button("시작하기", key="landing_start", width="stretch"):
@@ -1010,6 +1148,7 @@ def chatbot():
 
 
 
+base_style()
 if st.session_state.page == 0:
     landing()
 else:
@@ -1018,6 +1157,7 @@ else:
         go(0)
     with st.sidebar:
         claude_status_box()
+    inner_style()
 
     if st.session_state.page == 1:
         page_header("데이터 올리기", "표·글 파일을 넣으면 태그가 붙은 소재 카드가 만들어집니다.")
@@ -1030,7 +1170,7 @@ else:
         screen = screen_3
 
     # 화면마다 바뀌는 내용은 테두리 상자 안에 둠 (머리 부분은 상자 밖에서 세 화면 공통)
-    with st.container(border=True):
+    with st.container(key="inner_body"):
         screen()
 
 chatbot()
