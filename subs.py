@@ -11,6 +11,12 @@ TABLE = "subscriptions"
 
 
 def load_env():
+    # 내 컴퓨터에서는 .env 를, .env 가 없는 Streamlit Cloud 에서는 앱 설정의 Secrets 를 같은 이름으로 읽음
+    if not ENV_PATH.exists():
+        try:
+            return {key: str(value) for key, value in st.secrets.items()}
+        except Exception:  # Secrets 도 없으면 빈 묶음
+            return {}
     env = {}
     for line in ENV_PATH.read_text(encoding="utf-8").splitlines():
         line = line.strip()

@@ -1,5 +1,10 @@
+# Claude에게 소재 분류를 요청하고 챗봇 답을 받을 때 씀 (classifier.py, app.py)
 anthropic
+# 올린 CSV·XLSX를 표로 읽고, 결과를 표로 보여 주거나 다운로드 CSV로 만들 때 씀 (app.py, lunch.py, practice_table.py)
 pandas
+# 챗봇 아이콘으로 쓰려고 bot.png에서 로봇 얼굴만 잘라 작게 줄일 때 씀 (app.py)
 Pillow
+# Supabase 저장·조회, Gemini 호출, 게시물 URL 읽기, 카카오 API 호출을 할 때 씀 (app.py, classifier.py, crawler.py 외 화면 파일)
 requests
+# 모든 화면(버튼·입력칸·표·챗봇)을 그리고 웹 서비스로 띄울 때 씀 (app.py 외 화면 파일)
 streamlit
